@@ -353,9 +353,25 @@ export interface HostAgentPresets {
   /**
    * The standing scope key a reader with no agent resolves this preset's
    * registrations in — the view that holds its tools, since a roster keeps
-   * every model-facing row off the global layer.
+   * every model-facing row off the global layer. Handed over outright, with no
+   * lease to return; a host that publishes this alone predates
+   * {@link acquireScope}. Read only through {@link standingScopeFor}.
    */
-  standingKeyFor(id?: string): Promise<unknown>
+  standingKeyFor?(id?: string): Promise<unknown>
+  /**
+   * The same standing scope key, lent as a revision lease the caller disposes
+   * once its scoped read is over. A host publishing this returns the key on the
+   * lease rather than on its own promise, and publishes no `standingKeyFor`.
+   */
+  acquireScope?(id?: string): Promise<StandingScopeLease>
+}
+
+/** One preset's standing view, lent for as long as a reader needs it. */
+export interface StandingScopeLease {
+  /** The scope key every scoped read passes to the tool registry. */
+  readonly key: unknown
+  /** Returns the lease; absent when the host handed the key over outright. */
+  [Symbol.asyncDispose]?(): Promise<void>
 }
 
 /** One workspace record (subset of the host `Workspace` entity). */
@@ -526,6 +542,16 @@ export interface TurnStartData {
  */
 export interface UserMessageEventData {
   readonly id?: string
+  /**
+   * Where the message came from. A prompt minted by a browser client carries
+   * `rpcId`; this channel's own chat input and the host's synthetic context
+   * (skill catalogs, job notices, goal rounds) do not. That field is what lets
+   * the bridge mirror a browser prompt into a chat without echoing the chat's
+   * own input back to the person who typed it.
+   */
+  readonly source?: { readonly kind?: string; readonly rpcId?: string } | undefined
+  /** The model-facing blocks the prompt was recorded with. */
+  readonly content?: readonly { readonly type?: string; readonly text?: string }[] | undefined
 }
 
 /** The `assistant/chunk` payload fields this plugin streams. */
@@ -537,6 +563,31 @@ export interface AssistantChunkData {
    * deltas are raw JSON fragments reported through `tool/call` instead.
    */
   readonly chunk: { readonly type: string; readonly text?: string }
+}
+
+/**
+ * One ordered publication of an agent's live model output.
+ *
+ * Live output left the session log when `assistant/chunk` was retired: the loop
+ * now publishes it per agent, as a `start`, a series of `chunk`s, and one `end`.
+ * This channel translates each `chunk` frame back into {@link AssistantChunkData}
+ * so its renderers keep consuming one shape regardless of which host carried the
+ * text.
+ */
+export type AssistantStreamFrame =
+  | { readonly type: 'start'; readonly attemptId: string; readonly turn: number }
+  | { readonly type: 'chunk'; readonly attemptId: string; readonly chunk: AssistantChunkData['chunk'] }
+  | { readonly type: 'end'; readonly attemptId: string }
+
+/**
+ * The `agent/assistant-stream` payload fields this channel reads.
+ *
+ * Structural only: the agent's live session id names the conversation whose
+ * renderer receives the frame, and a frame that names no session is not ours.
+ */
+export interface AssistantStreamPayload {
+  readonly agent?: { readonly session?: { readonly id?: string } } | undefined
+  readonly frame?: AssistantStreamFrame | undefined
 }
 
 /** The `tool/result` payload fields a thinking process reports. */
@@ -680,6 +731,40 @@ export function assistantText(data: AssistantMessageData): string {
 }
 
 /**
+ * Read the standing scope one preset's registrations live in.
+ *
+ * Two host shapes publish this: `standingKeyFor` hands the key over outright,
+ * and its successor `acquireScope` lends the same key as a revision lease. One
+ * composition reads through here so the same deployment works on either, and
+ * the lease a newer host lends comes back to the caller, which owns releasing
+ * it for as long as it reads through the key.
+ * @param presets - the host preset roster.
+ * @param presetId - the resolved preset whose standing view is wanted.
+ * @returns the key and any lease the caller must dispose, or undefined when the
+ * host publishes neither reader.
+ */
+export async function standingScopeFor(
+  presets: HostAgentPresets,
+  presetId: string,
+): Promise<StandingScopeLease | undefined> {
+  if (presets.acquireScope !== undefined) return await presets.acquireScope(presetId)
+  if (presets.standingKeyFor !== undefined) return { key: await presets.standingKeyFor(presetId) }
+  return undefined
+}
+
+/**
+ * Render one recorded user prompt as the plain text a chat can read back.
+ * @param data - the `user/message` payload.
+ * @returns the prompt's text blocks joined in order, empty when it carries none.
+ */
+export function userText(data: UserMessageEventData): string {
+  return (data.content ?? [])
+    .filter(block => block.type === 'text' && block.text !== undefined && block.text !== '')
+    .map(block => block.text as string)
+    .join('')
+}
+
+/**
  * Render a failed turn's reason as one operator-readable line.
  * @param data - the closed turn payload.
  * @returns the error detail, empty when the turn did not fail.
@@ -731,5 +816,11 @@ declare module '@deepseek-ai/cordis' {
       request: HostApprovalRequest,
       next: () => Promise<HostApprovalOutcome>,
     ): Promise<HostApprovalOutcome>
+    /**
+     * One ordered publication of an agent's live model output. Agent-scoped:
+     * a listener receives only the agents whose frames reach its scope, and the
+     * payload's agent names the session whose renderer should read the frame.
+     */
+    'agent/assistant-stream'(payload: AssistantStreamPayload): void
   }
 }

@@ -53,7 +53,9 @@ import type {
   HostWorkspace,
   HostWorkspaceRegistry,
 } from './host.ts'
-import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent } from './host.ts'
+import type { AssistantStreamPayload } from './host.ts'
+import { standingScopeFor } from './host.ts'
+import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent, userText } from './host.ts'
 import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
 import { createMessageRenderer, createStreamRenderer, replyOptions } from './outbound.ts'
@@ -1058,13 +1060,18 @@ export function installBridge(
     const presets = ctx.get('agentPresets') as HostAgentPresets | undefined
     const presetId = presets === undefined ? undefined : (await presets.resolve(config.preset)).id
     // A roster keeps every tool off the global layer, so its standing key is
-    // the view that can describe this agent's calls.
-    const toolScope = presets === undefined || presetId === undefined
+    // the view that can describe this agent's calls. A host that lends that key
+    // as a revision lease keeps the lease here: the presenter below reads
+    // through it for as long as this composition lives, so it is given back
+    // with the plugin fiber rather than at the end of this call.
+    const standing = presets === undefined || presetId === undefined
       ? undefined
-      : await presets.standingKeyFor(presetId)
+      : await standingScopeFor(presets, presetId)
+    const releaseStanding = standing?.[Symbol.asyncDispose]
+    if (releaseStanding !== undefined) ctx.effect(() => () => releaseStanding())
     return {
       ...presetId === undefined ? {} : { presetId },
-      presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
+      presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, standing?.key),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
         composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
@@ -2865,6 +2872,40 @@ export function installBridge(
     aimAt(sessionId, binding, claimed)
   })
 
+  // Live model output no longer rides the session log: `assistant/chunk` was
+  // retired and the loop publishes `agent/assistant-stream` per agent instead.
+  // Translate each chunk frame back into the shape the renderers already read,
+  // so streaming — and the reasoning area of a thinking process — survives the
+  // move without either renderer knowing which host published the text.
+  const turnByAttempt = new Map<string, number>()
+  ctx.on('agent/assistant-stream', (payload: AssistantStreamPayload) => {
+    const sessionId = payload.agent?.session?.id
+    if (sessionId === undefined) return
+    const binding = bySession.get(sessionId)
+    if (binding === undefined) return
+    const frame = payload.frame
+    if (frame === undefined) return
+    if (frame.type === 'start') {
+      turnByAttempt.set(frame.attemptId, frame.turn)
+      return
+    }
+    if (frame.type === 'end') {
+      // This attempt's frames stop here; the next start re-registers its turn.
+      turnByAttempt.delete(frame.attemptId)
+      return
+    }
+    const turn = turnByAttempt.get(frame.attemptId)
+    // No start seen: this process attached mid-attempt. A chunk carries no turn
+    // of its own, so dropping it beats guessing which turn it belongs to.
+    if (turn === undefined) return
+    try {
+      binding.renderer.handle({ type: 'assistant/chunk', data: { turn, chunk: frame.chunk } })
+    } catch (error) {
+      notify(`lark-channel: rendering a live chunk of ${sessionId} failed: ${failureDetail(error)}`)
+      ctx.logger.warn('rendering a live chunk failed: %s', error)
+    }
+  })
+
   // Outbound: the owned chat's renderer decides what reaches the chat. The
   // bridge additionally remembers each call's arguments for the approval card,
   // and forgets the turn's calls once it closes.
@@ -2887,6 +2928,17 @@ export function installBridge(
       if (claimed !== undefined && event.data.id !== undefined) {
         targetByMessageId.delete(event.data.id)
         aimAt(session.id, binding, claimed)
+      }
+      // Mirror a prompt typed in another surface: the person driving this
+      // session from a browser still wants to read their own line here, beside
+      // the answer it produced. `rpcId` marks a browser-minted prompt, so this
+      // channel's own input — which has none — is never echoed back to the chat
+      // that sent it, and the host's synthetic context stays out of the chat.
+      if (event.data.source?.rpcId !== undefined) {
+        const mirrored = userText(event.data)
+        if (mirrored !== '') {
+          void port.send(binding.chatId, { markdown: mirrored }).catch(reportSendFailure)
+        }
       }
     } else if (isToolCallEvent(event)) {
       let calls = callSnapshots.get(session.id)
