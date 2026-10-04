@@ -5,6 +5,7 @@
 
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BOT_HOPS } from './botchat.ts'
+import type { DiagLevel } from './diag.ts'
 import type { SessionScope } from './session.ts'
 
 /**
@@ -253,6 +254,44 @@ export interface Config {
    * human — it grants more power than the sandbox allows.
    */
   approvers?: string[]
+  /**
+   * Report how the session picker (`/sessions`) admits or withholds every
+   * candidate, at warning level so it survives a logger configured above info.
+   *
+   * The picker's rules are silent by construction: a session any one of them
+   * excludes is simply absent from the card, and nothing in the chat tells "the
+   * corpus held nothing" apart from "every candidate tripped a rule". That
+   * makes a short list unattributable, which is the failure this reports: each
+   * withheld session is named with the rule that withheld it, then the counts
+   * at every stage of the derivation.
+   *
+   * Off by default. It is a diagnostic, not an operating mode: it reads the
+   * whole corpus anyway, but the line count scales with the number of withheld
+   * records, so a deployment with hundreds of sessions gets hundreds of lines.
+   */
+  diagnoseSessions?: boolean
+  /**
+   * File this channel's diagnostics are appended to. Absent disables the file
+   * sink, leaving reports on the process's terminal as before.
+   *
+   * This exists because the terminal is the ONLY sink the shipped profiles
+   * provide: no logger exporter is composed, cordis's own default exporter
+   * keeps a bounded in-memory ring, and the one exporter the harness vendors
+   * writes to stdout. A question asked after the bot's window was closed — the
+   * usual case, since the card is read on a phone — then has no record at all.
+   * Naming a file gives the channel a durable sink of its own, independent of
+   * how the host's logging happens to be configured.
+   *
+   * A path ending in an extension is the file; anything else is a directory the
+   * default filename (`dsh-lark-diagnostics.log`) is placed in.
+   */
+  diagnosticsFile?: string
+  /**
+   * Floor for what {@link Config.diagnosticsFile} keeps. `warn` leaves the file
+   * carrying only reports that say something went wrong, which is what a
+   * long-running deployment wants; `debug` traces one interaction in full.
+   */
+  diagnosticsLevel?: DiagLevel
 }
 
 /** Configuration after defaults have been resolved; credentials may still be pending onboarding. */
@@ -288,6 +327,9 @@ export interface ResolvedConfig {
   senderAllowlist: string[]
   groupAllowlist: string[]
   approvers: string[]
+  diagnoseSessions: boolean
+  diagnosticsFile?: string | undefined
+  diagnosticsLevel: DiagLevel
 }
 
 /** Loader-visible configuration schema and defaults. */
@@ -323,6 +365,9 @@ export const Config: z<Config> = z.object({
   senderAllowlist: z.array(String),
   groupAllowlist: z.array(String),
   approvers: z.array(String),
+  diagnoseSessions: z.boolean().default(false),
+  diagnosticsFile: z.string(),
+  diagnosticsLevel: z.union(['debug', 'info', 'warn', 'error'] as const).default('warn'),
 })
 
 /**
@@ -355,5 +400,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     senderAllowlist: config.senderAllowlist ?? [],
     groupAllowlist: config.groupAllowlist ?? [],
     approvers: config.approvers ?? [],
+    diagnoseSessions: config.diagnoseSessions ?? false,
+    diagnosticsLevel: config.diagnosticsLevel ?? 'warn',
   }
 }

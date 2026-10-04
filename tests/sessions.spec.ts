@@ -32,10 +32,25 @@ describe('what a conversation may continue', () => {
     const records: HostSessionRecord[] = [
       { header: { id: 'session-real', cwd: '/work', createdAt: 10 } },
       { header: { id: 'session-sub', cwd: '/work', createdAt: 20, origin: 'subagent', delegationDepth: 1 } },
-      { header: { id: 'session-forked', cwd: '/work', createdAt: 30, parentSession: 'session-real' } },
     ]
     expect(sessionChoices(records, new Map(), HERE, path => path).map(choice => choice.id))
       .toEqual(['session-real'])
+  })
+
+  it('offers a session that only carries fork lineage, as the Web tree does', () => {
+    // `parentSession` is fork lineage, not delegation: the Web client's
+    // `sessionVisible` reads `origin` alone, so it draws a forked session as an
+    // ordinary row. Treating lineage as delegation hid 4 of the 5 sessions one
+    // chat could see in the Web UI while that surface still listed them.
+    const records: HostSessionRecord[] = [
+      { header: { id: 'session-real', cwd: '/work', createdAt: 10 } },
+      { header: { id: 'session-forked', cwd: '/work', createdAt: 30, parentSession: 'session-real' } },
+      // A depth with no `origin` is not a classification either; the field is a
+      // recursion counter, and the Web tree does not read it for visibility.
+      { header: { id: 'session-deep', cwd: '/work', createdAt: 40, delegationDepth: 2 } },
+    ]
+    expect(sessionChoices(records, new Map(), HERE, path => path).map(choice => choice.id).sort())
+      .toEqual(['session-deep', 'session-forked', 'session-real'])
   })
 
   it('offers its own history and sessions no chat owns, and nothing else', () => {

@@ -116,6 +116,8 @@ import { createHopBudget, exhaustedNotice, judgeBotMessage, servedNotice, strang
 import { batonNote, PRESENCE_ORDER, PRESENCE_SECTION, presenceSection } from './presence.ts'
 import type { BotSelf } from './presence.ts'
 import { canonicalPathOf } from './containment.ts'
+import { createFileDiag } from './diag.ts'
+import type { DiagSink } from './diag.ts'
 import { instanceIdentity } from './instance.ts'
 import {
   isUnconfined,
@@ -732,6 +734,23 @@ export function installBridge(
     readonly quotaLimit?: number
   },
 ): void {
+  /**
+   * The channel's durable diagnostic sink, when the deployment named a file.
+   *
+   * Absent means the terminal stays the only record, which is the previous
+   * behaviour — a report about a short card is then readable only while the
+   * window that ran the bot is still open.
+   */
+  const diag: DiagSink = config.diagnosticsFile === undefined
+    ? () => {}
+    : createFileDiag(
+      {
+        file: config.diagnosticsFile,
+        ...config.cwd === undefined ? {} : { cwd: config.cwd },
+        level: config.diagnosticsLevel,
+      },
+      reason => notify(reason),
+    )
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
@@ -2489,6 +2508,7 @@ export function installBridge(
   const offeredSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
     const query = sessionQuery()
     if (query === undefined) return { rows: [], hidden: 0 }
+    const diagnose = config.diagnoseSessions === true
     return offerSessions({
       query,
       scope: {
@@ -2501,7 +2521,11 @@ export function installBridge(
       },
       canonical: path => canonicalPathOf(path) ?? path,
       signal: commandSignal(),
-      report: notify,
+      // The picker's account of itself is a diagnostic, so every line goes to
+      // the channel's own file as well as the terminal: the question it answers
+      // is usually asked long after the window that ran the bot was closed.
+      report: diagnose ? (line) => { diag('warn', line); notify(line) } : notify,
+      ...diagnose ? { diagnose: true } : {},
     })
   }
 

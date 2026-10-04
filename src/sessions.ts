@@ -292,15 +292,25 @@ export class ChatSessionPicks {
  * something to "continue" reads as noise — three rows of "你是代码仓库分析专家…"
  * burying the conversation someone is actually looking for.
  *
- * Three header facts say it, and any of them is enough: a deployment that
- * stamps only one still gets the right answer.
+ * ONLY `origin` says it, because that is the one field the host defines as the
+ * classification and the one the Web client reads. The other two header facts
+ * are NOT equivalent, and treating them as such hides conversation:
+ *
+ * - `parentSession` is fork lineage, not delegation. A session forked from
+ *   another, or one a tool created under a parent, carries it while remaining
+ *   an ordinary conversation a person can open — the Web tree draws it as a
+ *   visible row. Excluding those dropped 4 of the 5 sessions a chat could see.
+ * - `delegationDepth` counts recursion for the budget that bounds it, and is
+ *   `0` on every top-level session. It can only ever agree with `origin`.
+ *
+ * So the rule is the host's own, matched to the Web client's `sessionVisible`
+ * (`packages/client/ui-workspace/src/client/tree.ts`), which is what keeps the
+ * two surfaces showing one list.
  * @param record - the corpus record to judge.
  * @returns true when the session belongs to delegated work.
  */
 export function isDelegated(record: HostSessionRecord): boolean {
   return record.header?.origin === 'subagent'
-    || (record.header?.delegationDepth ?? 0) > 0
-    || record.header?.parentSession !== undefined
 }
 
 /**
@@ -368,41 +378,113 @@ export interface OfferedSessions {
  * @param canonical - resolves one path to its canonical form for comparison.
  * @returns the choices to offer, in card order.
  */
-export function sessionChoices(
+/**
+ * Why one record is not offered, when it is not.
+ *
+ * Named rather than boolean because the filters form a chain and a dropped
+ * record says nothing about which link removed it — the one fact an operator
+ * needs when the card comes back short.
+ */
+export type SessionDrop =
+  /** The header carries no usable id, so nothing can name it. */
+  | 'no-id'
+  /** Work an agent delegated to itself, not a conversation someone had. */
+  | 'delegated'
+  /** The operator archived it; the host hides these from every surface. */
+  | 'archived'
+  /** Another conversation of this channel owns it. */
+  | 'other-chat'
+  /** It runs in a different directory, so continuing it would move the sandbox. */
+  | 'other-workspace'
+  /** A keyword was given and neither its title nor its id matches. */
+  | 'keyword'
+
+/** One record's verdict: the choice to offer, or the reason it is withheld. */
+export interface SessionVerdict {
+  /** The session this verdict is about. */
+  readonly id: string
+  /** The directory its header carries, absent when it carries none. */
+  readonly cwd?: string | undefined
+  /** The offered choice, present exactly when `drop` is absent. */
+  readonly choice?: SessionChoice | undefined
+  /** Why it is withheld, absent when it is offered. */
+  readonly drop?: SessionDrop | undefined
+}
+
+/**
+ * Judge every record once, naming the filter that withheld it.
+ *
+ * The same rules {@link sessionChoices} applies, but keeping the reason beside
+ * each record instead of discarding it with the record. Keyword matching stays
+ * out of this: it is the one rule whose input is a title read the caller may
+ * not have paid for yet, and folding it in would report "no match" for records
+ * whose titles were never fetched.
+ * @param records - the host's corpus listing.
+ * @param titles - folded titles by session id.
+ * @param input - the conversation the picker is for.
+ * @param canonical - resolves one path to its canonical form for comparison.
+ * @returns one verdict per record, in corpus order.
+ */
+export function judgeSessions(
   records: readonly HostSessionRecord[],
   titles: ReadonlyMap<string, string>,
   input: SessionPickerInput,
   canonical: (path: string) => string,
-): SessionChoice[] {
+): SessionVerdict[] {
   const home = canonical(input.workspace)
-  const keyword = input.keyword?.trim().toLowerCase() ?? ''
-  const choices = records
-    .filter(record => typeof record.header?.id === 'string' && record.header.id !== '')
-    .filter(record => !isDelegated(record))
+  return records.map((record): SessionVerdict => {
+    const id = record.header?.id
+    const cwd = record.header?.cwd
+    const withhold = (drop: SessionDrop): SessionVerdict => ({
+      id: typeof id === 'string' ? id : '',
+      ...cwd === undefined ? {} : { cwd },
+      drop,
+    })
+    if (typeof id !== 'string' || id === '') return withhold('no-id')
+    if (isDelegated(record)) return withhold('delegated')
     // Archived means the operator hid it from every grouping surface. A chat
     // that kept offering it would be the one place that decision did not land.
-    .filter(record => input.archived?.has(record.header!.id!) !== true)
-    .filter(record => {
-      const id = record.header!.id!
-      // Own history, or a session no conversation owns. Another chat's session
-      // is never offered: its title alone summarizes what was said there.
-      return isOwnSession(id, input.base) || !isChatSession(id, input.marker)
-    })
+    if (input.archived?.has(id) === true) return withhold('archived')
+    // Own history, or a session no conversation owns. Another chat's session
+    // is never offered: its title alone summarizes what was said there.
+    if (!isOwnSession(id, input.base) && isChatSession(id, input.marker)) return withhold('other-chat')
     // A session carries the directory it runs in, so one from elsewhere would
     // move this conversation's sandbox without anyone saying so.
-    .filter(record => record.header?.cwd !== undefined && canonical(record.header.cwd) === home)
-    .map((record): SessionChoice => {
-      const id = record.header!.id!
-      const title = titles.get(id)
-      return {
+    if (cwd === undefined || canonical(cwd) !== home) return withhold('other-workspace')
+    const title = titles.get(id)
+    return {
+      id,
+      cwd,
+      choice: {
         id,
         ...title === undefined || title === '' ? {} : { title },
         ...record.header?.createdAt === undefined ? {} : { createdAt: record.header.createdAt },
         live: record.live === true,
         own: isOwnSession(id, input.base),
         current: id === input.current,
-      }
-    })
+      },
+    }
+  })
+}
+
+/**
+ * The sessions one conversation may continue, in card order.
+ * @param records - the host's corpus listing.
+ * @param titles - folded titles by session id.
+ * @param input - the conversation the picker is for.
+ * @param canonical - resolves one path to its canonical form for comparison.
+ * @returns the choices to offer, newest first.
+ */
+export function sessionChoices(
+  records: readonly HostSessionRecord[],
+  titles: ReadonlyMap<string, string>,
+  input: SessionPickerInput,
+  canonical: (path: string) => string,
+): SessionChoice[] {
+  const keyword = input.keyword?.trim().toLowerCase() ?? ''
+  const choices = judgeSessions(records, titles, input, canonical)
+    .map(verdict => verdict.choice)
+    .filter((choice): choice is SessionChoice => choice !== undefined)
     .filter(choice => keyword === ''
       || (choice.title ?? '').toLowerCase().includes(keyword)
       || choice.id.toLowerCase().includes(keyword))
@@ -451,6 +533,16 @@ export interface SessionOffer {
   readonly signal?: AbortSignal | undefined
   /** Where a listing failure is reported; the picker itself degrades to empty. */
   readonly report?: ((line: string) => void) | undefined
+  /**
+   * Whether to account for every candidate this derivation admits or drops.
+   *
+   * The filters are silent by construction: a record one of them excludes is
+   * simply absent from the card, and nothing tells "the corpus held nothing"
+   * apart from "every candidate tripped a rule". That makes a short list
+   * unattributable from the chat, which is exactly the question a report has
+   * to answer, so the derivation can be asked to describe itself.
+   */
+  readonly diagnose?: boolean | undefined
 }
 
 /**
@@ -484,6 +576,12 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
     return [] as readonly HostSessionRecord[]
   })
   const keyword = scope.keyword?.trim() ?? ''
+  // Judged once, keeping each record's verdict: the choices are the same
+  // answer, and the withheld ones are what a short card has to be explained by.
+  const judged = judgeSessions(records, new Map(), scope, canonical)
+  if (offer.diagnose === true) {
+    for (const line of accountFor(records, judged, scope, canonical)) offer.report?.(line)
+  }
   const candidates = sessionChoices(records, new Map(), { ...scope, keyword: '' }, canonical)
   // A keyword is matched against titles, so the titles have to exist before the
   // filter runs — the reason a keyword used to match nothing but ids. Bounded,
@@ -543,5 +641,86 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
     const title = titles.get(choice.id)
     return title === undefined ? choice : { ...choice, title }
   })
+  if (offer.diagnose === true) {
+    for (const line of accountForStages({ records, candidates, shortlist, described, kept, window, rows, keyword })) {
+      offer.report?.(line)
+    }
+  }
   return { rows, hidden: kept.length - rows.length + (shortlist.length - window.length) }
+}
+
+/**
+ * One line per withheld record, plus a per-reason tally.
+ *
+ * Every id is named because a count alone cannot say WHICH session went
+ * missing, and that is the whole question when a list comes back short — a
+ * chat that shows one row out of fifteen has to be attributable to a rule and
+ * to a session, not merely to arithmetic.
+ * @param records - the corpus as listed, for the total.
+ * @param judged - one verdict per record.
+ * @param scope - the conversation the list is for, so the rules can be stated.
+ * @param canonical - resolves one path to its canonical form.
+ * @returns the report lines, one per withheld record then the tally.
+ */
+export function accountFor(
+  records: readonly HostSessionRecord[],
+  judged: readonly SessionVerdict[],
+  scope: SessionPickerInput,
+  canonical: (path: string) => string,
+): string[] {
+  const lines = [`lark-channel: session picker: listed ${records.length} record(s)`]
+  lines.push(`lark-channel: session picker:   workspace=${canonical(scope.workspace)} base=${scope.base} current=${scope.current}`)
+  const dropped = judged.filter(verdict => verdict.drop !== undefined)
+  for (const verdict of dropped) {
+    lines.push(`lark-channel: session picker:   DROP ${verdict.id || '<no id>'} (${verdict.drop}) cwd=${verdict.cwd ?? '<none>'}`)
+  }
+  const tally = new Map<SessionDrop, number>()
+  for (const verdict of dropped) {
+    if (verdict.drop !== undefined) tally.set(verdict.drop, (tally.get(verdict.drop) ?? 0) + 1)
+  }
+  const offered = judged.length - dropped.length
+  const breakdown = [...tally].map(([reason, count]) => `${reason}=${count}`).join(' ')
+  lines.push(`lark-channel: session picker: offered ${offered} of ${judged.length}${breakdown === '' ? '' : `; withheld ${breakdown}`}`)
+  return lines
+}
+
+/**
+ * One line per stage the derivation passes through, then the rows it drew.
+ *
+ * A short list can shrink at four different places — the corpus listing, the
+ * eligibility rules, the describe window, and the "nothing ever happened here"
+ * rule — and each has a different owner. Naming the count at every stage is
+ * what tells those apart, which a single final number cannot.
+ * @param stages - the intermediate counts this derivation observed.
+ * @returns the report lines.
+ */
+export function accountForStages(stages: {
+  readonly records: readonly unknown[]
+  readonly candidates: readonly unknown[]
+  readonly shortlist: readonly SessionChoice[]
+  readonly described: readonly SessionChoice[]
+  readonly kept: readonly SessionChoice[]
+  readonly window: readonly SessionChoice[]
+  readonly rows: readonly SessionChoice[]
+  readonly keyword: string
+}): string[] {
+  const lines = [
+    `lark-channel: session picker: stages records=${stages.records.length}`
+    + ` candidates=${stages.candidates.length}`
+    + ` shortlist=${stages.shortlist.length}`
+    + `${stages.keyword === '' ? '' : ` (keyword="${stages.keyword}")`}`
+    + ` window=${stages.window.length}`
+    + ` described=${stages.described.length}`
+    + ` kept=${stages.kept.length}`
+    + ` rows=${stages.rows.length}`,
+  ]
+  const lostEmpty = stages.described.length - stages.kept.length
+  if (lostEmpty > 0) {
+    const empties = stages.described
+      .filter(choice => !stages.kept.includes(choice))
+      .map(choice => choice.id)
+    lines.push(`lark-channel: session picker:   dropped ${lostEmpty} as never-used: ${empties.join(', ')}`)
+  }
+  lines.push(`lark-channel: session picker: rows drawn: ${stages.rows.map(choice => choice.id).join(', ') || '<none>'}`)
+  return lines
 }
