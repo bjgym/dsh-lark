@@ -47,9 +47,12 @@ import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import { ApprovalPanel } from './ApprovalPanel.tsx'
-import { SettledApprovalsRegistry } from './decisions-source.ts'
+import { QuestionPanel } from './QuestionPanel.tsx'
+import { SettledApprovalsRegistry, SettledSourceRegistry } from './decisions-source.ts'
+import { foldSettledQuestions, type SettledQuestion } from './question-decisions.ts'
 import { createPanelFace, type DisplayReason, type PanelTarget } from './panel-store.ts'
-import { en, zh } from './locales.ts'
+import { createQuestionFace, type QuestionSpec, type QuestionTarget } from './question-store.ts'
+import { en, enQuestion, zh, zhQuestion } from './locales.ts'
 import type {} from './contract.ts'
 
 /** Cordis plugin name of the browser half; keep this stable after publishing. */
@@ -65,6 +68,9 @@ export const inject: string[] = ['sessions', 'slots', 'locale']
 /** Dictionary namespace owned by this plugin. */
 const NS = 'larkApproval'
 
+/** Dictionary namespace for the question takeover. */
+const QUESTION_NS = 'larkQuestion'
+
 /**
  * Install the Lark channel's approval presentation.
  *
@@ -75,9 +81,20 @@ const NS = 'larkApproval'
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'lark-ui: dictionaries')
+  ctx.effect(() => ctx.locale.register(QUESTION_NS, { zh: zhQuestion, en: enQuestion }), 'lark-ui: question dictionaries')
   const settled = new SettledApprovalsRegistry(ctx.sessions)
   const panel = createPanelFace(settled)
   ctx.effect(() => () => { settled.dispose() }, 'lark-ui: settled-approval reads')
+
+  // The question half reads the same event window through a different fold: the
+  // blocking tool's calls are not in the `userQuestions` projection, so the
+  // `tool/call` + `tool/result` pair in the log is the only shared record.
+  const settledQuestions = new SettledSourceRegistry<SettledQuestion>(ctx.sessions, {
+    read: foldSettledQuestions,
+    identityOf: question => question.callId,
+  })
+  const questionPanel = createQuestionFace(settledQuestions)
+  ctx.effect(() => () => { settledQuestions.dispose() }, 'lark-ui: settled-question reads')
 
   // Register through slots.inject, not a bare register(): the composer chain
   // is declared by ui-conversation's own apply, and this fiber can activate
@@ -128,8 +145,38 @@ export function apply(ctx: ClientContext): void {
       hooks: { larkSettled: panel.settledSource(sessionId) },
     }),
   }, ApprovalPanel))
+
+  // The question takeover, on the same terms and for the same reason. It claims
+  // only `question`: a plan review is still answered by this channel's shadowed
+  // plan tool in the chat, so the shipped panel keeps that one.
+  ctx.slots.inject('conversation.composer', () => ctx.slots.register({
+    name: 'conversation.composer',
+    priority: 0,
+    select: (owner: ComposerChainProps): QuestionTarget | null => {
+      const sessionId = owner.sessionId
+      if (sessionId === undefined) return null
+      // Read structurally rather than through the shipped question domain's
+      // merge: naming its package would put a second presentation package in
+      // this channel's dependency list to describe a value it only reads. The
+      // discriminator is `kind`, which the shared projection documents for
+      // exactly this purpose, and the fields below are the ones the type admits.
+      const pending = owner.pendingInteraction as
+        | { readonly kind?: string; readonly key?: string; readonly questions?: readonly QuestionSpec[] }
+        | undefined
+      if (pending === undefined || pending.kind !== 'question') return null
+      if (pending.key === undefined || pending.questions === undefined) return null
+      return { sessionId, key: pending.key, questions: pending.questions }
+    },
+    locale: QUESTION_NS,
+    inject: (sessionId) => ({
+      panel: questionPanel,
+      hooks: { larkQuestionSettled: questionPanel.settledSource(sessionId) },
+    }),
+  }, QuestionPanel))
 }
 
 /** Re-exported for the panel half and its tests. */
 export type { SettledApproval } from './decisions.ts'
+export type { SettledQuestion, SettledQuestionAnswer } from './question-decisions.ts'
 export type { PanelTarget, PanelFace, AnswerablePending } from './panel-store.ts'
+export type { QuestionTarget, QuestionFace, AnswerableQuestion } from './question-store.ts'

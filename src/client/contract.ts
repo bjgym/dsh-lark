@@ -15,10 +15,13 @@
 // interface is declared against a module TypeScript has actually resolved.
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type { ApprovalKey } from './locales.ts'
+import type { QuestionKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     /** The Lark approval panel's copy. */
     larkApproval: ApprovalKey
+    /** The Lark question panel's copy. */
+    larkQuestion: QuestionKey
   }
 }

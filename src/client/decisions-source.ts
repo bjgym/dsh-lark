@@ -1,31 +1,64 @@
 /**
- * Live settled-approval reads for the conversations this channel drives.
+ * Live settled-request reads for the conversations this channel drives.
  *
  * One source per session id, created on first use and kept for the page's
- * lifetime: a conversation the browser has open may settle approvals at any
+ * lifetime: a conversation the browser has open may settle a request at any
  * moment, and a source that is torn down between panels would have to replay
  * the window to answer the same question again.
+ *
+ * The skeleton — borrow the binding, follow its window, recompute, publish only
+ * on change, remember what this page settled itself — is the same for every
+ * domain this channel answers on two surfaces. What differs is only how the
+ * window folds and what identifies one settled item, so those two are injected
+ * through {@link SettledRead} and the rest is shared.
+ *
+ * Every consumer here is the TEMPORARY browser half of a two-surface request;
+ * see the plugin entry for why the durable fix belongs in the gateway.
  * @module dsh-lark-channel/client/decisions-source
  */
 
 import type { ISessions, SessionBinding } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionEventWindow } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { foldSettledElsewhere, type SettledApproval } from './decisions.ts'
 
 /**
- * Read-only source of the approvals one conversation settled elsewhere.
+ * How one conversation's settled set is folded out of its own event window.
+ *
+ * `answeredHere` carries the identities this browser settled itself; a settled
+ * request absent from it was settled by another surface, which is the only
+ * thing any panel here acts on.
+ */
+export interface SettledRead<T> {
+  /**
+   * Fold one conversation's window.
+   * @param window - the conversation's current event window.
+   * @param answeredHere - identities this browser decided itself.
+   * @returns settled requests this browser did not decide, in ask order.
+   */
+  read(window: SessionEventWindow, answeredHere: ReadonlySet<string>): readonly T[]
+  /**
+   * The identity one settled request is retired by.
+   * @param item - a settled request from this read.
+   * @returns the identity to record against, and to compare folds by.
+   */
+  identityOf(item: T): string
+}
+
+/**
+ * Read-only source of the requests one conversation settled elsewhere.
  *
  * `markAnsweredHere` records a request this browser decided itself, so the
  * panel it just closed does not come back described as somebody else's
  * decision. It is deliberately process-local: the fact it records is about
  * this page's own presses, not about the session.
  */
-export interface SettledApprovalsSource {
+export interface SettledSource<T> {
   /**
    * The most recent fold.
-   * @returns settled approvals this browser did not decide, in ask order.
+   * @returns settled requests this browser did not decide, in ask order.
    */
-  getSnapshot(): readonly SettledApproval[]
+  getSnapshot(): readonly T[]
   /**
    * Observe fold changes.
    * @param listener - invalidation callback.
@@ -34,7 +67,7 @@ export interface SettledApprovalsSource {
   subscribe(listener: () => void): () => void
   /**
    * Record one request identity this browser answered, retiring it from the fold.
-   * @param requestId - the `approval/asked` identity this browser decided.
+   * @param requestId - the identity this browser decided.
    */
   markAnsweredHere(requestId: string): void
   /** Detach from the conversation's window. */
@@ -50,23 +83,27 @@ export interface SettledApprovalsSource {
  * through `binding()` keeps this plugin out of the reference counts that decide
  * whether a conversation stays open.
  */
-export class SettledApprovalsRegistry {
-  private readonly sources = new Map<string, SettledApprovalsSource>()
+export class SettledSourceRegistry<T> {
+  private readonly sources = new Map<string, SettledSource<T>>()
 
   /**
    * @param sessions - the Client Session object layer this registry reads through.
+   * @param read - how one conversation's window folds, and what identifies an item.
    */
-  constructor(private readonly sessions: ISessions) {}
+  constructor(
+    private readonly sessions: ISessions,
+    private readonly read: SettledRead<T>,
+  ) {}
 
   /**
-   * The settled-approval source for one conversation, created on first use.
+   * The settled-set source for one conversation, created on first use.
    * @param sessionId - Session identity whose window supplies the fold.
    * @returns the shared source for that session.
    */
-  sourceFor(sessionId: SessionId): SettledApprovalsSource {
+  sourceFor(sessionId: SessionId): SettledSource<T> {
     const existing = this.sources.get(sessionId)
     if (existing !== undefined) return existing
-    const created = createSource(this.sessions, sessionId)
+    const created = new SessionSettled(this.sessions, sessionId, this.read)
     this.sources.set(sessionId, created)
     return created
   }
@@ -78,11 +115,24 @@ export class SettledApprovalsRegistry {
   }
 }
 
+/** The approval-settled registry, which is the generic skeleton over the approval fold. */
+export class SettledApprovalsRegistry extends SettledSourceRegistry<SettledApproval> {
+  /**
+   * @param sessions - the Client Session object layer this registry reads through.
+   */
+  constructor(sessions: ISessions) {
+    super(sessions, {
+      read: foldSettledElsewhere,
+      identityOf: approval => approval.id,
+    })
+  }
+}
+
 /** One session's fold, published on every window mutation it observes. */
-class SessionSettledApprovals implements SettledApprovalsSource {
+class SessionSettled<T> implements SettledSource<T> {
   private readonly listeners = new Set<() => void>()
   private readonly answeredHere = new Set<string>()
-  private read: readonly SettledApproval[] = []
+  private read: readonly T[] = []
   private binding: SessionBinding | undefined
   private unsubscribe: (() => void) | undefined
   private released = false
@@ -90,14 +140,16 @@ class SessionSettledApprovals implements SettledApprovalsSource {
   /**
    * @param sessions - Session object layer supplying the borrowed binding.
    * @param sessionId - conversation this source folds.
+   * @param how - how that conversation's window folds.
    */
   constructor(
     private readonly sessions: ISessions,
     private readonly sessionId: SessionId,
+    private readonly how: SettledRead<T>,
   ) {}
 
   /** @returns the most recent fold. */
-  getSnapshot(): readonly SettledApproval[] { return this.read }
+  getSnapshot(): readonly T[] { return this.read }
 
   /**
    * Observe fold changes.
@@ -112,7 +164,7 @@ class SessionSettledApprovals implements SettledApprovalsSource {
 
   /**
    * Retire one request this browser answered itself.
-   * @param requestId - the `approval/asked` identity this browser decided.
+   * @param requestId - the identity this browser decided.
    */
   markAnsweredHere(requestId: string): void {
     if (this.answeredHere.has(requestId)) return
@@ -147,37 +199,32 @@ class SessionSettledApprovals implements SettledApprovalsSource {
    * Recompute the fold and publish only when it moved.
    * @param window - current window, or the borrowed binding's when omitted.
    */
-  private republish(window?: ReturnType<SessionBinding['eventSource']['getSnapshot']>): void {
+  private republish(window?: SessionEventWindow): void {
     if (this.released) return
     const current = window ?? this.binding?.eventSource.getSnapshot()
     if (current === undefined) return
-    const next = foldSettledElsewhere(current, this.answeredHere)
-    if (sameFold(this.read, next)) return
+    const next = this.how.read(current, this.answeredHere)
+    if (sameSet(this.read, next, this.how.identityOf)) return
     this.read = next
     for (const listener of [...this.listeners]) listener()
   }
 }
 
 /**
- * Create one session's fold source.
- * @param sessions - Session object layer supplying the borrowed binding.
- * @param sessionId - conversation this source folds.
- * @returns the live source.
- */
-function createSource(sessions: ISessions, sessionId: SessionId): SettledApprovalsSource {
-  return new SessionSettledApprovals(sessions, sessionId)
-}
-
-/**
  * Whether two folds carry the same requests in the same order.
  * @param left - previous fold.
  * @param right - current fold.
+ * @param identityOf - the identity to compare one item by.
  * @returns true when nothing a consumer can observe changed.
  */
-function sameFold(left: readonly SettledApproval[], right: readonly SettledApproval[]): boolean {
+function sameSet<T>(
+  left: readonly T[],
+  right: readonly T[],
+  identityOf: (item: T) => string,
+): boolean {
   if (left.length !== right.length) return false
   return left.every((value, index) => {
     const other = right[index]
-    return other !== undefined && value.id === other.id && value.toolName === other.toolName && value.callId === other.callId
+    return other !== undefined && identityOf(value) === identityOf(other)
   })
 }

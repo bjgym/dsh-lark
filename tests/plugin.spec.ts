@@ -8,10 +8,10 @@ import { Context } from '@deepseek-ai/cordis'
 import type { CardActionEvent, NormalizedMessage, SendOptions } from '@larksuite/channel'
 import * as plugin from '../src/index.ts'
 import { GET_COMMAND, SEND_FILE_TOOL } from '../src/outbound-file.ts'
-import { QUESTION_TIMEOUT_MS } from '../src/questions.ts'
+import { QUESTION_TIMEOUT_MS, questionActionValue } from '../src/questions.ts'
 import { parseRoute } from '../src/model.ts'
 import * as invariant from '../src/invariant.ts'
-import type { HostApprovalOutcome, HostApprovalRequest } from '../src/host.ts'
+import type { HostApprovalOutcome, HostApprovalRequest, HostUserQuestionAnswer, HostUserQuestionRequest } from '../src/host.ts'
 import type { RegisterAppPort, RegisterAppRequest } from '../src/onboarding.ts'
 import { stripToolCallMarkup } from '../src/outbound.ts'
 import { workspaceSessionId } from '../src/workspace.ts'
@@ -432,13 +432,15 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('shadows the question tool and denies only what it cannot answer here', async () => {
+    it('leaves the host question tool in place, answering its request instead', async () => {
       const harness = await mountChannel()
       const created = await firstAgent(harness)
 
-      // Questions are answerable here — as a card — so the tool is shadowed in
-      // this agent's own layer rather than denied.
-      expect(created.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
+      // Questions are answerable here — as a card, beside the Web app's panel —
+      // so the tool the deployment composed is left exactly where it is. This
+      // channel registers no second tool under the same name: doing that would
+      // put the question back to one answerer and take the panel away.
+      expect(created.registeredTools.map((tool) => tool.name)).not.toContain('ask_user_question')
       expect(created.denyReason('ask_user_question')).toBeUndefined()
 
       // With no plan service composed there is no host plan tool to shadow,
@@ -471,10 +473,14 @@ describe('dsh-lark-channel', () => {
       )
       const created = await firstAgent(harness)
       expect(created.denyReason('exit_plan_mode')).toContain('Ask the user directly in your reply')
-      expect(created.denyReason('ask_user_question')).toBeDefined()
-      // And the model is told up front, so it asks in prose instead.
+      // Only a tool this channel had to shadow is re-denied. The question tool
+      // is never shadowed, so its host registration stands and the bridge
+      // answers the request that tool raises — deny it here and the model would
+      // be told questions are unavailable in a chat that shows them.
+      expect(created.denyReason('ask_user_question')).toBeUndefined()
+      // And the model is told up front about what genuinely is unavailable.
       const section = created.promptSections.find((s) => s.name === 'lark-channel:presence')
-      expect(section?.text).toContain('Unavailable here: ask_user_question, exit_plan_mode')
+      expect(section?.text).toContain('Unavailable here: exit_plan_mode')
       await harness.dispose()
     })
 
@@ -508,7 +514,9 @@ describe('dsh-lark-channel', () => {
       // Setup still runs: this channel composes its own per-agent world
       // (denied interaction tools, prompt guidance) with or without a roster.
       expect(created.setupRan).toBe(true)
-      expect(created.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
+      // The host's question tool is left where the deployment put it rather
+      // than re-registered here.
+      expect(created.registeredTools.map((tool) => tool.name)).not.toContain('ask_user_question')
       await harness.dispose()
     })
   })
@@ -4025,13 +4033,19 @@ describe('dsh-lark-channel', () => {
     await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
     const created = harness.agents.created[0]!
 
-    // The agent's own layer carries the shadow; running it is what the model does.
-    const shadow = created.registeredTools.find((tool) => tool.name === 'ask_user_question') as unknown as {
-      execute(args: unknown, exec: unknown): Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>
-    }
-    const answered = shadow.execute(
-      { questions: [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }, { label: '取消' }] }] },
-      { agent: created.agent },
+    // The host's own tool raises this request. The trailing answerer stands in
+    // for whatever follows this channel — the Web app's panel, in a composed
+    // Client — and rejects here because a chain nobody claims has no answer to
+    // give.
+    const answered = harness.ctx.waterfall(
+      'user-questions/request',
+      {
+        questions: [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }, { label: '取消' }] }],
+        agent: created.agent,
+      },
+      async (): Promise<HostUserQuestionAnswer> => {
+        throw new Error('no user-questions answerer accepted the request')
+      },
     )
 
     // It reaches the chat as a card with the model's own options.
@@ -4046,6 +4060,130 @@ describe('dsh-lark-channel', () => {
     })
     // The answer went to the question, so no second turn was spent on it.
     expect(created.agent.followup).toHaveBeenCalledTimes(1)
+    await harness.dispose()
+  })
+
+  it('answers a questioned click with the option the model offered', async () => {
+    const harness = await mountChannel()
+    await harness.fake.emitMessage(fakeMessage({ content: 'go?' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const created = harness.agents.created[0]!
+
+    const answered = harness.ctx.waterfall(
+      'user-questions/request',
+      {
+        questions: [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }, { label: '取消' }] }],
+        agent: created.agent,
+      },
+      async (): Promise<HostUserQuestionAnswer> => {
+        throw new Error('no user-questions answerer accepted the request')
+      },
+    )
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+
+    const card = harness.fake.sent.find((m) => 'card' in m.input)!.input as { card: object }
+    const choose = cardControls(card.card)
+      .map((control) => questionActionValue(control.value))
+      .find((value) => value?.option === 1)!
+    await harness.fake.emitCardAction(clickAction(choose))
+
+    expect(await answered).toEqual({ answers: [{ id: 'q1', selected: ['取消'] }] })
+    await harness.dispose()
+  })
+
+  it('delegates a question for a conversation this channel does not hold', async () => {
+    // A session the Web app is driving on its own has no binding here, so the
+    // panel must stay the only surface for it: claiming it would put a card in
+    // a chat that never asked.
+    const harness = await mountChannel()
+    let answeredBehind = false
+    const outcome = await harness.ctx.waterfall(
+      'user-questions/request',
+      {
+        questions: [{ id: 'q1', question: '谁的问题？' }],
+        agent: { session: { id: 'session-elsewhere' } },
+      } as HostUserQuestionRequest,
+      async (): Promise<HostUserQuestionAnswer> => {
+        answeredBehind = true
+        return { answers: [{ id: 'q1', selected: ['别处'] }] }
+      },
+    )
+
+    expect(answeredBehind).toBe(true)
+    expect(outcome).toEqual({ answers: [{ id: 'q1', selected: ['别处'] }] })
+    expect(harness.fake.sent).toHaveLength(0)
+    await harness.dispose()
+  })
+
+  it('offers one question on both surfaces, and lets the other one answer it', async () => {
+    const harness = await mountChannel()
+    await harness.fake.emitMessage(fakeMessage({ content: 'go?' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const created = harness.agents.created[0]!
+
+    // The trailing answerer stands in for the Web app's panel: it takes the
+    // question and holds it until whoever is at that surface decides.
+    const reached = Promise.withResolvers<void>()
+    const behind = Promise.withResolvers<HostUserQuestionAnswer>()
+    const outcome = harness.ctx.waterfall(
+      'user-questions/request',
+      {
+        questions: [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }, { label: '取消' }] }],
+        agent: created.agent,
+      },
+      () => { reached.resolve(); return behind.promise },
+    )
+
+    // The chat gets its card...
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+    // ...and the question STILL reaches the answerer behind, which is what puts
+    // it on the other surface as well. Neither takes it from the other.
+    await reached.promise
+
+    behind.resolve({ answers: [{ id: 'q1', selected: ['取消'] }] })
+    expect(await outcome).toEqual({ answers: [{ id: 'q1', selected: ['取消'] }] })
+
+    // The card the chat left standing is retired, naming where the answer came
+    // from rather than reading as a press this room made.
+    await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+    expect(JSON.stringify(harness.fake.updated[0]!.card)).toContain('已在网页端作答')
+    expect(JSON.stringify(harness.fake.updated[0]!.card)).toContain('取消')
+    await harness.dispose()
+  })
+
+  it('stops asking the rest of a batch another surface already answered', async () => {
+    // The Web panel submits every question at once while the chat asks them one
+    // at a time, so a batch claimed mid-flight must not open a card for a
+    // question that has already been answered somewhere else.
+    const harness = await mountChannel()
+    await harness.fake.emitMessage(fakeMessage({ content: 'go?' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const created = harness.agents.created[0]!
+
+    const reached = Promise.withResolvers<void>()
+    const behind = Promise.withResolvers<HostUserQuestionAnswer>()
+    const outcome = harness.ctx.waterfall(
+      'user-questions/request',
+      {
+        questions: [
+          { id: 'q1', question: '第一个？', options: [{ label: 'A' }] },
+          { id: 'q2', question: '第二个？', options: [{ label: 'B' }] },
+        ],
+        agent: created.agent,
+      },
+      () => { reached.resolve(); return behind.promise },
+    )
+
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+    await reached.promise
+    behind.resolve({ answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: ['B'] }] })
+
+    expect(await outcome).toEqual({
+      answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: ['B'] }],
+    })
+    // Exactly one card was ever sent: the second question was never asked here.
+    expect(harness.fake.sent.filter((m) => 'card' in m.input)).toHaveLength(1)
+    expect(JSON.stringify(harness.fake.sent)).not.toContain('第二个？')
     await harness.dispose()
   })
 

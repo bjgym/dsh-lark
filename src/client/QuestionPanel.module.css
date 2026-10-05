@@ -1,0 +1,66 @@
+/* The question takeover the Lark channel renders in the Web composer. */
+
+.root {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 720px;
+  padding: 14px 16px;
+  border: 1px solid var(--dsw-border-subtle, rgba(0, 0, 0, 0.12));
+  border-radius: 10px;
+  background: var(--dsw-surface-raised, rgba(0, 0, 0, 0.02));
+}
+
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  opacity: 0.75;
+}
+
+.question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.header {
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.prompt {
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.detail {
+  font-size: 13px;
+  white-space: pre-wrap;
+  opacity: 0.8;
+}
+
+.actionRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.freeText {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-border-subtle, rgba(0, 0, 0, 0.12));
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}

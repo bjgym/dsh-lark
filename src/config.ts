@@ -271,16 +271,6 @@ export interface Config {
    */
   diagnoseSessions?: boolean
   /**
-   * TEMPORARY — leave the host's own `ask_user_question` in place instead of
-   * shadowing it, so a test can see whether `user-questions/request` reaches
-   * this process.
-   *
-   * Remove this field, its schema entry, and its reads once the question path is
-   * settled. It exists only to answer one question that decides the design: can
-   * a chat card JOIN the Web app's question panel, or can it only replace it.
-   */
-  probeHostQuestions?: boolean
-  /**
    * File this channel's diagnostics are appended to. Absent disables the file
    * sink, leaving reports on the process's terminal as before.
    *
@@ -338,8 +328,6 @@ export interface ResolvedConfig {
   groupAllowlist: string[]
   approvers: string[]
   diagnoseSessions: boolean
-  /** TEMPORARY — see {@link Config.probeHostQuestions}. */
-  probeHostQuestions: boolean
   diagnosticsFile?: string | undefined
   diagnosticsLevel: DiagLevel
 }
@@ -378,7 +366,6 @@ export const Config: z<Config> = z.object({
   groupAllowlist: z.array(String),
   approvers: z.array(String),
   diagnoseSessions: z.boolean().default(false),
-  probeHostQuestions: z.boolean().default(false),
   diagnosticsFile: z.string(),
   diagnosticsLevel: z.union(['debug', 'info', 'warn', 'error'] as const).default('warn'),
 })
@@ -414,7 +401,6 @@ export function resolveConfig(config: Config): ResolvedConfig {
     groupAllowlist: config.groupAllowlist ?? [],
     approvers: config.approvers ?? [],
     diagnoseSessions: config.diagnoseSessions ?? false,
-    probeHostQuestions: config.probeHostQuestions ?? false,
     diagnosticsLevel: config.diagnosticsLevel ?? 'warn',
   }
 }

@@ -490,6 +490,10 @@ const QUESTION = {
   title: { zh: '需要你确认', en: 'A decision is needed' },
   context: { zh: '助手需要一个决定才能继续', en: 'The assistant needs your answer to continue' },
   answered: { zh: '已作答', en: 'Answered' },
+  // The same question is offered on more than one surface, and the one that
+  // answers first wins. A card the OTHER surface answered must say so: the room
+  // would otherwise read a decision it never made.
+  answeredInWeb: { zh: '已在网页端作答', en: 'Answered in the web app' },
   cancelled: { zh: '这个提问已取消', en: 'Question cancelled' },
   answer: { zh: '你的回答', en: 'Your answer' },
   replyWithOptions: {
@@ -761,6 +765,10 @@ export function questionCard(input: {
 
 /**
  * The card a question is replaced with once answered.
+ *
+ * `elsewhere` names the surface that answered when it was not this chat. The
+ * same question is offered on both, and the card would otherwise read as a
+ * decision taken by whoever is reading it.
  * @param input - the question asked, and how it ended.
  * @returns a schema 2.0 card object.
  */
@@ -769,9 +777,13 @@ export function settledQuestionCard(input: {
   readonly header?: string | undefined
   readonly answer?: string | undefined
   readonly cancelled?: boolean | undefined
+  /** Whether another surface answered, so no press happened here. */
+  readonly elsewhere?: boolean | undefined
 }): object {
   const state: CardState = input.cancelled === true ? 'neutral' : 'success'
-  const title = input.cancelled === true ? QUESTION.cancelled : QUESTION.answered
+  const title = input.cancelled === true
+    ? QUESTION.cancelled
+    : input.elsewhere === true ? QUESTION.answeredInWeb : QUESTION.answered
   const answer = clip(input.answer ?? '', REASON_MAX_CHARS)
   const asked = input.header ?? QUESTION.title
   const summary = isCopy(asked)

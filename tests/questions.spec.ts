@@ -4,11 +4,10 @@ import {
   QUESTION_ACTION,
   questionActionValue,
   questionCard,
-  shadowQuestionTool,
   SUBMIT_OPTION,
 } from '../src/questions.ts'
-import type { AskedQuestion, QuestionAnswer } from '../src/questions.ts'
-import { assertRegistrableTool, assertSupportedSchema, cardControls, cardTexts } from './harness.ts'
+import type { AskedQuestion } from '../src/questions.ts'
+import { cardControls, cardTexts } from './harness.ts'
 
 /** One question with two options, as a model would ask it. */
 const asked: AskedQuestion = {
@@ -246,87 +245,65 @@ describe('ChatQuestions', () => {
   })
 })
 
-describe('shadow tool definition', () => {
-  it('declares schemas the registry accepts, in compiled form', () => {
-    // Production rejected the first version of this definition: both schemas
-    // were written in the per-property spec form that `defineTool` compiles,
-    // while the registry validates real JSON Schema. Agent creation failed
-    // outright, so the chat could not start at all.
-    const definition = shadowQuestionTool(async () => []) as {
-      name: string
-      parameters: unknown
-      output: { schema: unknown }
-    }
-    expect(() => { assertRegistrableTool(definition) }).not.toThrow()
-    expect(definition.parameters).toMatchObject({ type: 'object', required: ['questions'] })
-    expect(definition.output.schema).toMatchObject({ type: 'object', required: ['answers'] })
+describe('retiring cards the other surface answered', () => {
+  it('settles the open card into the answer that arrived, naming where it came from', async () => {
+    const { store, sent, updated } = createStore()
+    const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+
+    store.settleElsewhere({ sessionId: 's1', decided: false }, [{ id: 'q-deploy', selected: ['现在部署'] }])
+
+    expect(await pending).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+    await vi.waitFor(() => { expect(updated).toHaveLength(1) })
+    // The card must not read as a press this chat made: nobody here pressed it.
+    expect(JSON.stringify(updated[0]!.card)).toContain('已在网页端作答')
   })
 
-  it('the checker that guards it rejects the exact shape that shipped', () => {
-    // The spec form the host compiles — required as a per-property flag.
-    expect(() => {
-      assertSupportedSchema({
-        type: 'object',
-        properties: { answers: { type: 'array', required: true, items: { type: 'string' } } },
-      })
-    }).toThrow(/required must be an array/)
-  })
+  it('settles into the typed answer when the other surface wrote one', async () => {
+    const { store, sent, updated } = createStore()
+    const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
 
-  it('normalizes a malformed call rather than failing the turn', async () => {
-    const definition = shadowQuestionTool(async () => []) as {
-      execute(args: unknown, exec: unknown): Promise<{ answers: unknown[] }>
-    }
-    expect(await definition.execute({ questions: 'not-an-array' }, {})).toEqual({ answers: [] })
-  })
-
-  it('declares the host contract the registry validates', () => {
-    const definition = shadowQuestionTool(async () => []) as {
-      name: string
-      description: string
-      parameters: Record<string, unknown>
-      output: { schema: object; render: (a: unknown, v: unknown) => unknown[] }
-      execute: (args: unknown, exec: unknown) => Promise<unknown>
-    }
-    expect(definition.name).toBe('ask_user_question')
-    expect((definition.parameters as { properties: Record<string, unknown> }).properties.questions).toBeDefined()
-    expect(typeof definition.output.render).toBe('function')
-    expect(definition.output.render({}, { answers: [] })).toEqual([{ type: 'text', text: '{"answers":[]}' }])
-  })
-
-  it('normalizes the model\'s arguments and carries the session through', async () => {
-    const seen: { questions: readonly AskedQuestion[]; sessionId: string | undefined }[] = []
-    const definition = shadowQuestionTool(async (questions, sessionId) => {
-      seen.push({ questions, sessionId })
-      return questions.map((question): QuestionAnswer => ({ id: question.id, selected: ['ok'] }))
-    }) as { execute: (args: unknown, exec: unknown) => Promise<{ answers: QuestionAnswer[] }> }
-
-    const result = await definition.execute(
-      {
-        questions: [{
-          id: 'q1',
-          question: '继续？',
-          header: '确认',
-          multi_select: true,
-          options: [{ label: '是', description: '继续执行' }, { label: '否' }],
-        }],
-      },
-      { agent: { session: { id: 'lark-oc_1' } } },
+    store.settleElsewhere(
+      { sessionId: 's1', decided: false },
+      [{ id: 'q-deploy', selected: [], custom: '等周五再上' }],
     )
-    expect(result).toEqual({ answers: [{ id: 'q1', selected: ['ok'] }] })
-    expect(seen[0]!.sessionId).toBe('lark-oc_1')
-    expect(seen[0]!.questions[0]).toEqual({
-      id: 'q1',
-      question: '继续？',
-      header: '确认',
-      multiSelect: true,
-      options: [{ label: '是', description: '继续执行' }, { label: '否' }],
-    })
+
+    expect(await pending).toEqual({ id: 'q-deploy', selected: [], custom: '等周五再上' })
+    await vi.waitFor(() => { expect(updated).toHaveLength(1) })
+    expect(JSON.stringify(updated[0]!.card)).toContain('等周五再上')
   })
 
-  it('survives a call with no questions and no agent', async () => {
-    const definition = shadowQuestionTool(async () => []) as {
-      execute: (args: unknown, exec: unknown) => Promise<{ answers: QuestionAnswer[] }>
-    }
-    expect(await definition.execute({}, {})).toEqual({ answers: [] })
+  it('marks the batch decided, so a loop through it stops asking', async () => {
+    const { store, sent } = createStore()
+    void store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+
+    const run = { sessionId: 's1', decided: false }
+    store.settleElsewhere(run, [])
+
+    expect(run.decided).toBe(true)
+  })
+
+  it('answers empty for a question the other surface left out of its batch', async () => {
+    const { store, sent } = createStore()
+    const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+
+    store.settleElsewhere({ sessionId: 's1', decided: false }, [{ id: 'someone-else', selected: ['x'] }])
+
+    expect(await pending).toEqual({ id: 'q-deploy', selected: [] })
+  })
+
+  it('leaves another conversation\'s open card waiting', async () => {
+    const { store, sent } = createStore()
+    void store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    void store.ask({ sessionId: 's2', chatId: 'oc_2', question: { ...asked, id: 'q-other' } })
+    await vi.waitFor(() => { expect(sent).toHaveLength(2) })
+
+    store.settleElsewhere({ sessionId: 's2', decided: false }, [])
+
+    expect(store.awaiting('s1')).toBe(true)
+    expect(store.awaiting('s2')).toBe(false)
   })
 })

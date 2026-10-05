@@ -51,6 +51,9 @@ import type {
   HostSystemPrompt,
   HostTools,
   HostUserMessage,
+  HostUserQuestionAnswer,
+  HostUserQuestionItem,
+  HostUserQuestionRequest,
   HostWorkspace,
   HostWorkspaceRegistry,
 } from './host.ts'
@@ -98,11 +101,11 @@ import {
 import type { CatalogEntry, ModelActionValue } from './model.ts'
 import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
 import type { StatusFields } from './status.ts'
-import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue, shadowQuestionTool } from './questions.ts'
+import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue } from './questions.ts'
 import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
 import type { HostPlanMode, PlanReviewPorts } from './plan.ts'
 import type { PermissionActionValue, PresetOption } from './permission.ts'
-import type { AskedQuestion, QuestionAnswer } from './questions.ts'
+import type { AskedQuestion, ChatQuestionBatch, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
@@ -607,13 +610,37 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
 }
 
 /**
+ * One host question, in the shape this channel's card machinery takes.
+ *
+ * The host's `detail` and its presentation `intent` have no card affordance
+ * here, so a question carrying either is shown as its own text and options — the
+ * tool that raises them is shadowed by this channel rather than answered through
+ * the waterfall, so neither reaches this path in a composed deployment.
+ * @param item - one question of the host's request.
+ * @returns the question to hand the card store.
+ */
+function askedQuestionOf(item: HostUserQuestionItem): AskedQuestion {
+  return {
+    id: item.id,
+    question: item.question,
+    ...item.header === undefined ? {} : { header: item.header },
+    ...item.options === undefined ? {} : {
+      options: item.options.map(option => ({
+        label: option.label,
+        ...option.description === undefined ? {} : { description: option.description },
+      })),
+    },
+    ...item.multiSelect === undefined ? {} : { multiSelect: item.multiSelect },
+  }
+}
+
+/**
  * Compose the parts of a chat agent's world this channel owns: the tools it
- * must not call, the one tool this channel adds, and the prompt sentence that
+ * must not call, the tools this channel adds, and the prompt sentence that
  * tells the model what to do instead. Every registration is scoped to this one
  * agent.
  * @param agentCtx - the agent's scope context, inside creation `setup`.
  * @param config - resolved plugin configuration.
- * @param askQuestions - how a question reaches this agent's chat, when it can.
  * @param planReview - how a plan is reviewed in this agent's chat, when it can be.
  * @param sendFiles - how an artifact reaches this agent's chat, when it may.
  * @param self - the bot account this agent speaks as.
@@ -621,7 +648,6 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
 function composeChatAgent(
   agentCtx: Context,
   config: ResolvedConfig,
-  askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
   planReview: PlanReviewPorts | undefined,
   sendFiles: SendFilePorts | undefined,
   self: BotSelf,
@@ -629,31 +655,21 @@ function composeChatAgent(
   const tools = agentCtx.get('tools') as HostTools | undefined
   const denied = new Set(config.denyTools)
 
-  // Shadow the host's question tool for THIS agent: its answer would otherwise
-  // surface on whichever UI claimed the single `userQuestions` provider, while
-  // the person who asked is here. Registered before the guard so a deployment
-  // that also denies the name still denies it — configuration wins.
-  // TEMPORARY PROBE — the shadow and its deny are switched off by config so the
-  // host's own `ask_user_question` can run and prove whether
-  // `user-questions/request` reaches this process at all. Remove this switch
-  // (and its Config field) once the question path is settled.
-  const probeHostQuestions = config.probeHostQuestions === true
-  const shadowed = !probeHostQuestions
-    && askQuestions !== undefined
-    && !denied.has(QUESTION_TOOL)
-    && tools?.register !== undefined
-  if (shadowed) tools?.register?.(shadowQuestionTool(askQuestions))
-  // A registry too old to shadow leaves the host's GUI-only tool in place;
-  // denying it keeps the model from asking where no one is watching.
-  if (!shadowed && askQuestions !== undefined && !probeHostQuestions) denied.add(QUESTION_TOOL)
-  // TEMPORARY PROBE — remove once the question path is settled. Records which
-  // branch the composition took, which nothing else does: a shadow that never
-  // registered shows up only as a model that stopped using the tool. Written
-  // through the logger rather than the diagnostic sink, which this module-level
-  // function cannot see.
-  agentCtx.logger.warn('PROBE question shadow askQuestions=%s hasRegister=%s deniedByConfig=%s shadowed=%s',
-    askQuestions !== undefined, tools?.register !== undefined,
-    config.denyTools.includes(QUESTION_TOOL), shadowed)
+  // The host's own `ask_user_question` is NOT shadowed. Its answer used to have
+  // to come from whichever UI claimed the single `userQuestions` provider, so a
+  // chat whose human was right here replaced the tool to answer it locally. The
+  // bridge now answers `user-questions/request` instead, which is the same
+  // question raised once for every presentation: the model keeps the tool the
+  // deployment composed, the Web app keeps its panel, and this channel adds a
+  // card beside it rather than in place of it. Shadowing here would put the tool
+  // back to one answerer and take the panel away from the browser.
+  //
+  // A deployment that denies the name still denies it through the guard below,
+  // and that refusal is what keeps a model from asking where nobody is watching.
+  if (denied.has(QUESTION_TOOL)) agentCtx.logger.warn(
+    '%s is denied by configuration: questions in this channel have no card and no panel',
+    QUESTION_TOOL,
+  )
 
   // The plan tool is shadowed for the same reason and on the same terms: its
   // review reaches for that same single-provider seam. Only worth registering
@@ -1047,34 +1063,82 @@ export function installBridge(
   })
 
   /**
-   * Ask this agent's chat, one question at a time. Sequential on purpose: two
-   * open cards in one conversation would leave a typed answer ambiguous.
+   * One structured-question batch, offered on both surfaces at once.
+   *
+   * The chat card and the answerer behind this listener — the Web app's panel,
+   * in the deployment this was built for — are two presentations of the SAME
+   * request, so neither takes the question away from the other: whichever
+   * answer arrives first is the answer the tool receives.
+   *
+   * The trailing answerer REJECTS instead of resolving a fail-closed outcome,
+   * which is where this differs from an approval. A deployment with no browser
+   * attached therefore throws rather than handing back something to compare, and
+   * that branch has to drop out of the race: treating the throw as an answer
+   * would refuse a question the card on screen can still take. Dropping out is
+   * expressed as a promise that never settles, the same shape the approval
+   * listener uses for its fail-closed value.
+   *
+   * Racing is also why the batch may stop early: see {@link askInChat}.
+   * @param binding - the chat the question is offered in.
+   * @param sessionId - the session the question belongs to.
+   * @param request - the host's request, as the tool raised it.
+   * @param next - the answerer chain behind this listener.
+   * @returns the first answer to arrive.
    */
-  const askQuestions = async (
-    asked: readonly AskedQuestion[],
-    sessionId: string | undefined,
-  ): Promise<QuestionAnswer[]> => {
-    const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
-    // TEMPORARY PROBE — remove with the others. The branch below answers EMPTY
-    // rather than throwing, so a question that never reached a chat is
-    // indistinguishable from one the user declined to answer. This records which
-    // it was, and whether the session id arrived at all.
-    diag('warn', 'PROBE question ask'
-      + ` sessionId=${sessionId ?? '(undefined)'}`
-      + ` binding=${binding === undefined ? 'MISS' : 'HIT'}`
-      + ` count=${asked.length}`
-      + ` ids=${asked.map(question => question.id).join(',')}`)
-    if (binding === undefined || sessionId === undefined) {
-      // No chat to ask in — answer empty rather than hang the turn.
-      return asked.map(question => ({ id: question.id, selected: [] }))
-    }
+  const askOnBothSurfaces = async (
+    binding: ChatBinding,
+    sessionId: string,
+    request: HostUserQuestionRequest,
+    next: () => Promise<HostUserQuestionAnswer>,
+  ): Promise<HostUserQuestionAnswer> => {
+    const run: ChatQuestionBatch = { sessionId, decided: false }
+    const viaChat = askInChat(run, binding, request)
+    // Rejection is the chain reporting that nobody claimed the question, so the
+    // Web branch drops out rather than failing the whole ask.
+    const viaWeb = next().then(
+      answer => ({ from: 'web' as const, answer }),
+      () => NEVER_SETTLES,
+    )
+    const winner = await Promise.race([
+      viaChat.then(answer => ({ from: 'chat' as const, answer })),
+      viaWeb,
+    ])
+    if (winner.from === 'chat') return winner.answer
+    // The Web app answered first. Retire the chat's cards for this batch, saying
+    // where the answer came from instead of waiting for a press that would be
+    // discarded.
+    questions.settleElsewhere(run, winner.answer.answers)
+    return winner.answer
+  }
+
+  /**
+   * Ask this chat one batch, one card at a time.
+   *
+   * Sequential on purpose: two open cards in one conversation would leave a
+   * typed answer ambiguous. The batch stops the moment another surface claims
+   * it — the Web panel answers all questions at once, so asking the next one
+   * would leave a card with nothing left to decide.
+   * @param run - the batch's own state, shared with the retirement path.
+   * @param binding - the chat the cards go to.
+   * @param request - the host's request.
+   * @returns one answer per question actually asked.
+   */
+  const askInChat = async (
+    run: ChatQuestionBatch,
+    binding: ChatBinding,
+    request: HostUserQuestionRequest,
+  ): Promise<HostUserQuestionAnswer> => {
     const answers: QuestionAnswer[] = []
-    for (const question of asked) {
-      answers.push(await questions.ask({ sessionId, chatId: binding.chatId, question }))
+    for (const item of request.questions) {
+      if (run.decided) break
+      answers.push(await questions.ask({
+        sessionId: run.sessionId,
+        chatId: binding.chatId,
+        question: askedQuestionOf(item),
+        ...request.signal === undefined ? {} : { signal: request.signal },
+      }))
     }
-    diag('warn', `PROBE question answered count=${answers.length}`
-      + ` selected=${JSON.stringify(answers.map(answer => answer.selected))}`)
-    return answers
+    return { answers }
   }
 
   /**
@@ -1161,7 +1225,7 @@ export function installBridge(
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, standing?.key),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
+        composeChatAgent(agentCtx, config, planReview, sendFilePorts, botSelf())
       },
     }
   }
@@ -1299,7 +1363,10 @@ export function installBridge(
    * calls through the preset's view, which a model change does not alter.
    */
   const bindings = new Map<string, Promise<ChatBinding>>()
-  const bindingFor = (sessionId: string, msg: NormalizedMessage): Promise<ChatBinding> => {
+  const bindingFor = (
+    sessionId: string,
+    chat: { readonly chatId: string; readonly chatType: string },
+  ): Promise<ChatBinding> => {
     let pending = bindings.get(sessionId)
     if (pending === undefined) {
       pending = (async (): Promise<ChatBinding> => {
@@ -1308,9 +1375,9 @@ export function installBridge(
         // the next conversation bound on this id to read the roster fresh.
         compositions.delete(sessionId)
         const binding: ChatBinding = {
-          chatId: msg.chatId,
-          chatType: msg.chatType,
-          renderer: renderFor(msg.chatId, presentCall),
+          chatId: chat.chatId,
+          chatType: chat.chatType,
+          renderer: renderFor(chat.chatId, presentCall),
         }
         if (unwound) {
           // The fiber unwound while this was composing; nothing will ever
@@ -2626,6 +2693,21 @@ export function installBridge(
       }
     }
     await chatSessionPicks.set(value.key, choice.id === derived ? undefined : choice.id)
+    // The chat now claims that conversation, so it starts watching it here
+    // rather than on its next message. A binding is what routes a session's
+    // events to this chat, and until one exists every event of that session is
+    // dropped — so without this line a turn driven from the Web app on the
+    // session this chat just claimed reaches the chat not at all, and only
+    // recovers once somebody happens to type here.
+    //
+    // Only a row that is NOT this conversation's own derived id is bound: those
+    // rows come from the corpus listing, so each names a session that already
+    // exists. Picking the derived id means going back to a session this chat
+    // creates with its next message, and there is nothing to watch yet — the
+    // message path binds it then, exactly as it binds every fresh conversation.
+    if (choice.id !== derived) {
+      await bindingFor(choice.id, { chatId: value.chatId, chatType: value.chatType })
+    }
     // Dropped rather than updated: the rows themselves are unchanged, but one of
     // them just became the current one, and a cached list would paint the card
     // with the row the person moved TO still looking like an option. The next
@@ -3353,18 +3435,24 @@ export function installBridge(
     if (isTurnEndEvent(event)) aimAt(session.id, binding, undefined)
   })
 
-  // TEMPORARY PROBE — remove once the question path is settled, with the
-  // `probeHostQuestions` switch. Observes only: it never claims the request, so
-  // the Web app's own answerer still runs and its panel still appears. What it
-  // answers is whether this event reaches this process at all, which decides
-  // whether a chat card can join the Web panel instead of replacing it.
+  // Structured questions are offered on both surfaces at once, exactly as
+  // approvals are: this chat gets a card and whatever answerer follows gets the
+  // Web app's question panel, and the first answer decides.
+  //
+  // PREPEND for the same reason the approval listener prepends. The Web app's
+  // answerer is registered during tree load and holds the question until a
+  // browser answers it, so a listener behind it would never be reached and a
+  // chat would wait forever on a question nobody in the browser is looking at.
+  //
+  // Only a conversation this channel already holds a binding for is claimed.
+  // Everything else — a session the Web app is driving on its own — delegates,
+  // and that delegation is what keeps the panel the only surface for it.
   ctx.on('user-questions/request', (request, next) => {
-    const owner = request.agent?.session.id ?? '(no agent)'
-    diag('warn', `PROBE uq event agent=${owner} questions=${request.questions.length}`
-      + ` ids=${request.questions.map(question => question.id).join(',')}`
-      + ` timed=${request.wait?.timed === true}`)
-    return next()
-  })
+    const sessionId = request.agent?.session.id
+    const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
+    if (binding === undefined || sessionId === undefined) return next()
+    return askOnBothSurfaces(binding, sessionId, request, next)
+  }, { prepend: true })
 
   // Approval questions for owned agents become cards; everything else delegates.
   //
@@ -3379,16 +3467,6 @@ export function installBridge(
   // listener still delegates every session it does not own.
   ctx.on('approval/request', (request, next) => {
     const binding = bySession.get(request.agent.session.id)
-    // TEMPORARY PROBE — remove with the others. A session this channel does not
-    // hold a binding for is answered entirely by the next listener, so a
-    // Web-driven turn in a conversation the chat has not touched yet produces no
-    // card. This records which it was, and names the session so the two can be
-    // told apart.
-    diag('warn', 'PROBE approval request'
-      + ` session=${request.agent.session.id}`
-      + ` binding=${binding === undefined ? 'MISS' : 'HIT'}`
-      + ` tool=${request.toolName}`
-      + ` bound=${[...bySession.keys()].join(',') || '(none)'}`)
     if (binding === undefined) return next()
     return askViaCard(binding, request, next)
   }, { prepend: true })

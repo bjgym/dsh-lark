@@ -778,17 +778,62 @@ export function turnErrorDetail(data: TurnEndData): string {
 /** Closed outcome of a host approval question; `'allowed-once'` is the only grant. */
 export type HostApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
+/** One choice a structured question offers, as the model wrote it. */
+export interface HostUserQuestionOption {
+  /** User-facing label the answer echoes back. */
+  readonly label: string
+  /** Optional extra context a capable UI renders beside the label. */
+  readonly description?: string | undefined
+}
+
+/** One question of a host structured-question request. */
+export interface HostUserQuestionItem {
+  /** Stable caller-provided identity, echoed in the answer. */
+  readonly id: string
+  /** The question to display. */
+  readonly question: string
+  /** Optional short heading the asker grouped it under. */
+  readonly header?: string | undefined
+  /** Optional supporting detail kept out of the option labels. */
+  readonly detail?: string | undefined
+  /** Choices offered, when the asker named any. */
+  readonly options?: readonly HostUserQuestionOption[] | undefined
+  /** Whether more than one option may be selected. Defaults to single-select. */
+  readonly multiSelect?: boolean | undefined
+}
+
 /**
- * TEMPORARY — the subset of one host structured-question request this channel
- * reads while observing the waterfall. Remove with `Config.probeHostQuestions`.
+ * One structured question the host asks through its own answerer waterfall.
+ *
+ * The host's `ask_user_question` tool raises this whatever presentation answers
+ * it, so the channel's card and the Web app's panel are two offers of the SAME
+ * question rather than two tools with one name.
  */
 export interface HostUserQuestionRequest {
-  /** The questions to display. */
-  readonly questions: readonly { readonly id: string }[]
-  /** The agent the question is asked on behalf of, when the asker named one. */
+  /** The questions to display, in ask order. */
+  readonly questions: readonly HostUserQuestionItem[]
+  /** The agent the question is asked on behalf of; absent when the asker named none. */
   readonly agent?: { readonly session: { readonly id: string } } | undefined
+  /** Cancellation lifetime of the pending question. */
+  readonly signal?: AbortSignal | undefined
   /** Foreground-wait facts; present only for the opt-in timed tool. */
   readonly wait?: { readonly callId: string; readonly timed?: boolean } | undefined
+}
+
+/** One answered question, in the shape the host's tool returns. */
+export interface HostUserQuestionAnswerItem {
+  /** The answered question's own id. */
+  readonly id: string
+  /** Labels chosen; empty when the human typed instead or skipped it. */
+  readonly selected: readonly string[]
+  /** Free text the human typed, when they did. */
+  readonly custom?: string | undefined
+}
+
+/** The answer to one structured-question request, as the waterfall returns it. */
+export interface HostUserQuestionAnswer {
+  /** One item per question asked. */
+  readonly answers: readonly HostUserQuestionAnswerItem[]
 }
 
 /** Readonly same-process permission question (subset of `ApprovalRequest`). */
@@ -830,12 +875,20 @@ declare module '@deepseek-ai/cordis' {
       next: () => Promise<HostApprovalOutcome>,
     ): Promise<HostApprovalOutcome>
     /**
-     * TEMPORARY — the host's structured-question waterfall, declared only so one
-     * observation listener can be registered against it while the question path
-     * is being settled. Remove with `Config.probeHostQuestions`.
+     * Ask composed answerers for structured user input. Return an answer to
+     * claim the request or call `next()` to delegate. Scope-filtered dispatch:
+     * an agent-scoped listener receives only that agent.
+     *
+     * Unlike `approval/request`, a chain nobody claims REJECTS: the innermost
+     * answerer throws rather than resolving a fail-closed outcome, so a listener
+     * that delegates and waits must treat rejection as "another surface will
+     * decide, or none will" rather than as an answer.
      * @mode waterfall
      */
-    'user-questions/request'(request: HostUserQuestionRequest, next: () => Promise<never>): Promise<never>
+    'user-questions/request'(
+      request: HostUserQuestionRequest,
+      next: () => Promise<HostUserQuestionAnswer>,
+    ): Promise<HostUserQuestionAnswer>
     /**
      * One ordered publication of an agent's live model output. Agent-scoped:
      * a listener receives only the agents whose frames reach its scope, and the

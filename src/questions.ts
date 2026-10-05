@@ -47,10 +47,30 @@ export interface AskedQuestion {
 /** One answer, in the shape the host's own tool returns. */
 export interface QuestionAnswer {
   readonly id: string
-  /** Labels the human chose; empty when they typed instead or declined. */
-  readonly selected: string[]
+  /**
+   * Labels the human chose; empty when they typed instead or declined.
+   *
+   * Read-only because an answer that arrived from another surface is the host's
+   * own value: this channel reads it into a card and hands it straight back, so
+   * nothing here may write to it.
+   */
+  readonly selected: readonly string[]
   /** Free text the human typed, when they did. */
-  readonly custom?: string
+  readonly custom?: string | undefined
+}
+
+/**
+ * One question batch as this channel tracks it while both surfaces are live.
+ *
+ * `decided` is set the instant the other surface claims the batch, so the loop
+ * working through its questions can stop before it opens a card for a question
+ * that has already been answered elsewhere.
+ */
+export interface ChatQuestionBatch {
+  /** The conversation whose cards this batch owns. */
+  readonly sessionId: string
+  /** Whether another surface has already answered the batch. */
+  decided: boolean
 }
 
 /** Card payload carried by one option choice, or by a submitted set of them. */
@@ -115,13 +135,19 @@ export function questionCard(question: AskedQuestion, id: string): object {
  */
 export function settledQuestionCard(
   question: AskedQuestion,
-  outcome: { readonly answer?: string | undefined; readonly cancelled?: boolean },
+  outcome: {
+    readonly answer?: string | undefined
+    readonly cancelled?: boolean
+    /** Whether another surface answered, so no press happened in this chat. */
+    readonly elsewhere?: boolean | undefined
+  },
 ): object {
   return buildSettledQuestionCard({
     question: question.question,
     header: question.header,
     answer: outcome.answer,
     cancelled: outcome.cancelled,
+    ...outcome.elsewhere === true ? { elsewhere: true } : {},
   })
 }
 
@@ -295,13 +321,49 @@ export class ChatQuestions {
   }
 
   /**
+   * Retire this chat's cards for one batch because another surface answered it.
+   *
+   * The same question is offered in the chat and on whatever surface the host
+   * asks besides it — the Web app's panel, in the deployment this was built for
+   * — and the first answer is the one the tool receives. When the other one
+   * wins, the card left here can no longer decide anything, so it is settled
+   * into the answer that actually arrived rather than left inviting a press that
+   * would be discarded.
+   *
+   * `run.decided` is set FIRST: the batch loop shares this object and must stop
+   * before it opens a card for a question the other surface has already
+   * answered. A batch claimed mid-flight therefore has fewer cards than
+   * questions, which is correct — the remaining ones were never shown.
+   * @param run - the batch being offered, marked decided by this call.
+   * @param answers - the answers the other surface gave, by question id.
+   */
+  settleElsewhere(run: ChatQuestionBatch, answers: readonly QuestionAnswer[]): void {
+    run.decided = true
+    for (const [id, entry] of this.pending) {
+      if (entry.sessionId !== run.sessionId || entry.settled) continue
+      const settled = answers.find(candidate => candidate.id === entry.question.id)
+        ?? { id: entry.question.id, selected: [] }
+      this.finish(id, settled, false, shownAnswer(settled), true, true)
+    }
+  }
+
+  /**
    * Settle one question exactly once and repaint its card.
    * @param repaint - false when the caller paints the card itself, which a
    * click does through its own response — the only repaint path that cannot
    * fail silently, since the patch API reports business errors in a body the
    * SDK discards rather than by rejecting.
+   * @param elsewhere - whether another surface gave this answer, so the card
+   * names where it came from instead of implying a press happened here.
    */
-  private finish(id: string, answer: QuestionAnswer, cancelled: boolean, shown?: string, repaint = true): boolean {
+  private finish(
+    id: string,
+    answer: QuestionAnswer,
+    cancelled: boolean,
+    shown?: string,
+    repaint = true,
+    elsewhere = false,
+  ): boolean {
     const entry = this.pending.get(id)
     if (entry === undefined || entry.settled) return false
     entry.settled = true
@@ -309,7 +371,9 @@ export class ChatQuestions {
     if (repaint && entry.messageId !== undefined) {
       const card = settledQuestionCard(
         entry.question,
-        cancelled ? { cancelled: true } : { answer: shown ?? '' },
+        cancelled
+          ? { cancelled: true }
+          : { answer: shown ?? '', ...elsewhere ? { elsewhere: true } : {} },
       )
       void this.ports.update(entry.messageId, card).catch((error: unknown) => {
         this.ports.report(`lark-channel: repainting a settled question failed: ${String(error)}`)
@@ -320,116 +384,10 @@ export class ChatQuestions {
 }
 
 /**
- * The shadow tool definition, declared structurally like every other host
- * contract here so the package keeps building against two published packages
- * alone — the host's `defineTool` would drag its whole runtime closure into
- * this repository to construct one object.
- *
- * Both schemas are therefore written in their COMPILED form: real JSON Schema
- * with `required` as an array on each object. `defineTool` exists to perform
- * exactly that conversion from a per-property spec, and a definition written in
- * the spec form is rejected by the registry — which is the contract that
- * matters, and which validates this at registration.
- *
- * The schema mirrors the host's own `ask_user_question` so a model that learned
- * the tool from any other surface calls this one the same way. Arguments are
- * normalized rather than rejected: a question with a slightly-off shape is
- * still worth asking, where a schema error would just fail the turn.
- * @param ask - asks one question and resolves with its answer.
- * @returns the definition to register in an agent's scope.
+ * How one settled answer reads on its card.
+ * @param answer - the answer that arrived.
+ * @returns the labels joined for display, or the typed text when it chose none.
  */
-export function shadowQuestionTool(
-  ask: (questions: readonly AskedQuestion[], agentSessionId: string | undefined) => Promise<QuestionAnswer[]>,
-): object {
-  return {
-    name: 'ask_user_question',
-    description:
-      'Ask the user a concise question when you need confirmation, a choice, or missing information '
-      + 'before proceeding. Each question needs a stable id that is echoed in the answer. Offer options '
-      + 'when the choice is between known alternatives; the user may also answer in their own words.',
-    parameters: {
-      type: 'object',
-      required: ['questions'],
-      properties: {
-        questions: {
-          type: 'array',
-          description: 'Questions to ask the user before continuing.',
-          items: {
-            type: 'object',
-            additionalProperties: true,
-            required: ['id', 'question'],
-            properties: {
-              id: { type: 'string', description: 'Stable id for this question; echoed in the answer.' },
-              question: { type: 'string', description: 'The specific question to ask.' },
-              header: { type: 'string', description: 'Optional short heading.' },
-              options: {
-                type: 'array',
-                description: 'Optional choices to show the user.',
-                items: {
-                  type: 'object',
-                  additionalProperties: true,
-                  required: ['label'],
-                  properties: {
-                    label: { type: 'string', description: 'Short user-facing option label.' },
-                    description: { type: 'string', description: 'One sentence on the tradeoff.' },
-                  },
-                },
-              },
-              multi_select: { type: 'boolean', description: 'Whether several options may be chosen.' },
-            },
-          },
-        },
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['answers'],
-        properties: {
-          answers: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              required: ['id', 'selected'],
-              properties: {
-                id: { type: 'string' },
-                selected: { type: 'array', items: { type: 'string' } },
-                custom: { type: 'string' },
-              },
-            },
-          },
-        },
-      },
-      render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
-    },
-    async execute(args: unknown, exec: unknown): Promise<{ answers: QuestionAnswer[] }> {
-      // Total by construction. Without `defineTool`'s validating wrapper this
-      // body IS the validation, and a malformed call must degrade to asking
-      // nothing rather than throwing inside the model's turn.
-      const supplied = (args as { questions?: unknown } | null | undefined)?.questions
-      const raw = (Array.isArray(supplied) ? supplied : []).filter(
-        (entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null,
-      )
-      const questions: AskedQuestion[] = raw.map(entry => ({
-        id: String(entry.id ?? ''),
-        question: String(entry.question ?? ''),
-        ...typeof entry.header === 'string' ? { header: entry.header } : {},
-        ...Array.isArray(entry.options)
-          ? {
-              options: entry.options
-                .filter((option): option is Record<string, unknown> => typeof option === 'object' && option !== null)
-                .map(option => ({
-                  label: String(option.label ?? ''),
-                  ...typeof option.description === 'string' ? { description: option.description } : {},
-                })),
-            }
-          : {},
-        ...typeof entry.multi_select === 'boolean' ? { multiSelect: entry.multi_select } : {},
-      }))
-      const sessionId = (exec as { agent?: { session?: { id?: string } } }).agent?.session?.id
-      return { answers: await ask(questions, sessionId) }
-    },
-  }
+function shownAnswer(answer: QuestionAnswer): string {
+  return answer.selected.length > 0 ? answer.selected.join('、') : answer.custom ?? ''
 }
