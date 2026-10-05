@@ -719,10 +719,17 @@ export async function mountChannel(
     presets?: HostAgentPresets
     /**
      * An answerer registered BEFORE the plugin, as a host row that mounts
-     * during tree load is (the Web app's BFF claims every audited approval and
-     * never delegates). Records whether it was ever consulted.
+     * during tree load is. It stands in for the Web app's BFF: it takes the
+     * question and holds it until that surface decides, which it does through
+     * `decide`. Records whether it was ever consulted.
      */
-    competingAnswerer?: { claims: { toolName: string }[] }
+    competingAnswerer?: {
+      claims: { toolName: string }[]
+      /** Resolves the question on the other surface's behalf. */
+      decide?: ((outcome: HostApprovalOutcome) => void) | undefined
+      /** Told once the question has reached this answerer. */
+      delivered?: (() => void) | undefined
+    }
     /** The `tools` registry the bridge describes calls through. */
     tools?: object
     /** The `workspaceRegistry` chat sessions are accounted under. */
@@ -763,8 +770,13 @@ export async function mountChannel(
   if (competing !== undefined) {
     ctx.on('approval/request', (request) => {
       competing.claims.push({ toolName: request.toolName })
-      // Claims the question without delegating, exactly like the BFF.
-      return new Promise<HostApprovalOutcome>(() => {})
+      // Stands in for the Web app's answerer: it takes the question and holds
+      // it until someone at that surface decides — or forever, when nobody
+      // does. `decide` is how a test plays the browser's press.
+      return new Promise<HostApprovalOutcome>((resolve) => {
+        competing.decide = resolve
+        competing.delivered?.()
+      })
     })
   }
   ctx.provide('agents', agents.service)

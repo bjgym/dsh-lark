@@ -19,6 +19,7 @@ import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, resolve, sep } from 'node:path'
 import { epochSessionId } from './epoch.ts'
+import type { ConversationSubject } from './session.ts'
 import { sessionIdFor } from './session.ts'
 
 /** Switch or show this conversation's workspace. Channel-owned: it needs no agent. */
@@ -26,6 +27,12 @@ export const CD_COMMAND = 'cd'
 
 /** List the workspaces this channel knows. Channel-owned: it needs no agent. */
 export const WS_COMMAND = 'ws'
+
+/** Marks this plugin's workspace rows apart from other card actions. */
+export const WORKSPACE_ACTION = 'dsh-lark-channel/workspaces'
+
+/** How many workspace rows one page of the picker draws. */
+export const WS_PAGE_ROWS = 10
 
 /** Entry value marking "explicitly the default": a deep-merged patch cannot delete a key. */
 const DEFAULT_MARKER = ''
@@ -123,8 +130,7 @@ export type SwitchResult =
   | { readonly ok: false; readonly reason: string }
 
 /** Construction options for {@link ChatWorkspaces}. */
-export interface ChatWorkspacesOptions {
-  /** The deployment default directory (resolved, not necessarily canonical). */
+export interface ChatWorkspacesOptions {  /** The deployment default directory (resolved, not necessarily canonical). */
   readonly defaultPath: string
   /** Persisted conversation-key → directory entries; {@link DEFAULT_MARKER} means default. */
   readonly entries?: Record<string, string> | undefined
@@ -304,7 +310,141 @@ export class ChatWorkspaces {
 }
 
 /**
+ * One directory the picker offers as a row.
+ *
+ * The name leads and the path follows, the way a workspace is named anywhere
+ * else: a person reaches for `deepseek`, and the full path is what tells two
+ * directories of the same name apart.
+ */
+export interface WorkspaceChoice {
+  /** The canonical directory this row would switch to. */
+  readonly path: string
+  /** Its last segment, which is what a reader recognizes. */
+  readonly name: string
+  /** Whether this is the deployment default. */
+  readonly isDefault: boolean
+  /** Whether the conversation runs here now. */
+  readonly current: boolean
+}
+
+/**
+ * Every directory this conversation may switch to, current one first.
+ *
+ * The current directory leads rather than sitting in place, because it is the
+ * one fact a reader checks before anything else — and a page that could hide it
+ * would make the card unable to say where the conversation is.
+ * @param store - the workspace state.
+ * @param key - the conversation key.
+ * @returns the rows to offer, current first then the rest in listing order.
+ */
+export function workspaceChoices(store: ChatWorkspaces, key: string): WorkspaceChoice[] {
+  const current = store.pathFor(key)
+  const paths = store.knownPaths()
+  const rows = paths.map((path): WorkspaceChoice => ({
+    path,
+    name: basename(path),
+    isDefault: path === paths[0],
+    current: path === current,
+  }))
+  // Stable within each group: the current row is moved, never re-sorted, so the
+  // rest keep the registry's order and a reader finds a directory where the
+  // previous page left it.
+  return [...rows.filter(row => row.current), ...rows.filter(row => !row.current)]
+}
+
+/** One page of workspace rows, and where it sits in the whole list. */
+export interface WorkspacePage {
+  /** The rows this page draws, at most {@link WS_PAGE_ROWS}. */
+  readonly rows: readonly WorkspaceChoice[]
+  /** Zero-based page index, clamped into range. */
+  readonly page: number
+  /** Total pages, never zero — an empty list is still one page. */
+  readonly pages: number
+}
+
+/**
+ * The slice of rows one page shows.
+ *
+ * The current directory is pinned to the first page's first row whatever page
+ * was asked for, so every page can say where the conversation is. It is drawn
+ * there and nowhere else: a row that appeared on two pages would be two buttons
+ * for one directory.
+ * @param choices - the rows to paginate, current first.
+ * @param page - the requested zero-based page; out-of-range values clamp.
+ * @returns the rows to draw and the page's position.
+ */
+export function workspacePage(choices: readonly WorkspaceChoice[], page: number): WorkspacePage {
+  const pinned = choices.filter(choice => choice.current)
+  const rest = choices.filter(choice => !choice.current)
+  // The pinned row occupies a slot on the FIRST page only. Reserving its slot on
+  // every page would draw the same directory twice — two buttons for one
+  // destination — and would shrink pages that do not carry it.
+  const capacity = Math.max(1, WS_PAGE_ROWS - pinned.length)
+  // The first page holds the pinned row plus `capacity` others; every later page
+  // holds `WS_PAGE_ROWS`. Counting the first page as a full `capacity` of `rest`
+  // is what makes the pages partition the list exactly once.
+  const afterFirst = Math.max(0, rest.length - capacity)
+  const pages = Math.max(1, 1 + Math.ceil(afterFirst / WS_PAGE_ROWS))
+  const index = Math.min(Math.max(0, Math.trunc(page)), pages - 1)
+  const rows = index === 0
+    ? [...pinned, ...rest.slice(0, capacity)]
+    : rest.slice(capacity + (index - 1) * WS_PAGE_ROWS, capacity + index * WS_PAGE_ROWS)
+  return { rows, page: index, pages }
+}
+
+/** Card payload carried by one workspace row, or by a page control. */
+export interface WorkspaceActionValue extends ConversationSubject {
+  readonly kind: typeof WORKSPACE_ACTION
+  /**
+   * The directory to switch to, absent on a page control.
+   *
+   * The path travels with the button rather than being re-derived at press
+   * time, because the row a person pressed IS the authorization: the picker
+   * drew it from {@link ChatWorkspaces.knownPaths}, and the switch re-probes it
+   * against the same guards a typed `/cd` faces. Nothing here is trusted.
+   */
+  readonly path?: string | undefined
+  /** The page to draw; absent when the row itself is the subject. */
+  readonly page?: number | undefined
+}
+
+/**
+ * Narrow an arbitrary card-action value to this module's payload.
+ * @param value - raw button value from a card action event.
+ * @returns the typed payload, or undefined for foreign card actions.
+ */
+export function workspaceActionValue(value: unknown): WorkspaceActionValue | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (record.kind !== WORKSPACE_ACTION) return undefined
+  if (typeof record.key !== 'string' || record.key === '') return undefined
+  if (typeof record.chatId !== 'string' || typeof record.chatType !== 'string') return undefined
+  if (record.owner !== undefined && typeof record.owner !== 'string') return undefined
+  if (record.path !== undefined && (typeof record.path !== 'string' || record.path === '')) return undefined
+  if (record.page !== undefined
+    && (typeof record.page !== 'number' || !Number.isSafeInteger(record.page) || record.page < 0)) return undefined
+  // A button that names neither is inert, and accepting it would authorize a
+  // press that can do nothing.
+  if (record.path === undefined && record.page === undefined) return undefined
+  return {
+    kind: WORKSPACE_ACTION,
+    key: record.key,
+    chatId: record.chatId,
+    chatType: record.chatType,
+    ...record.owner === undefined ? {} : { owner: record.owner },
+    ...record.path === undefined ? {} : { path: record.path },
+    ...record.page === undefined ? {} : { page: record.page },
+  }
+}
+
+/**
  * Run one workspace command line and produce the chat reply.
+ *
+ * `/ws` no longer comes here: it answers with a card whose rows are pressed,
+ * which is the whole point of the picker. What remains is `/cd`, kept complete
+ * because the picker can only offer directories the channel already knows —
+ * a directory nobody has used with the host yet has no row, and typing its path
+ * is the only way to reach it.
  * @param name - the parsed command name, {@link CD_COMMAND} or {@link WS_COMMAND}.
  * @param line - the complete line, slash included.
  * @param key - the conversation the command is about.
@@ -321,23 +461,6 @@ export async function runWorkspaceCommand(
   store: ChatWorkspaces,
   onSwitched: () => Promise<void>,
 ): Promise<string> {
-  if (name === WS_COMMAND) {
-    const current = store.pathFor(key)
-    const paths = store.knownPaths()
-    const rows = paths.map((path, index) => {
-      const marks = [
-        ...index === 0 ? ['默认'] : [],
-        ...path === current ? ['当前'] : [],
-      ]
-      return `- \`${basename(path)}\` ${path}${marks.length > 0 ? `（${marks.join('，')}）` : ''}`
-    })
-    return [
-      '**工作区**',
-      ...rows,
-      `用 \`/${CD_COMMAND} <路径或名字>\` 切换；每个目录的会话上下文各自保留。`,
-    ].join('\n')
-  }
-
   const argument = line.trimStart().slice(1 + name.length).trim()
   if (argument === '') {
     return `📁 当前工作区：\`${store.pathFor(key)}\`${store.isDefault(key) ? '（默认）' : ''}`

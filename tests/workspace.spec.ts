@@ -1,6 +1,6 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { sessionIdFor } from '../src/session.ts'
 import {
@@ -10,6 +10,7 @@ import {
   probeDirectory,
   runWorkspaceCommand,
   withinRoots,
+  workspaceChoices,
   workspaceSessionId,
 } from '../src/workspace.ts'
 import type { WorkspaceProbe } from '../src/workspace.ts'
@@ -231,13 +232,16 @@ describe('runWorkspaceCommand', () => {
     expect(releases).toBe(0)
   })
 
-  it('lists known workspaces with shorthands, marking default and current', async () => {
+  it('offers known workspaces as rows, default and current among them', () => {
+    // `/ws` no longer answers in markdown: the bridge draws a card from these
+    // rows and a press performs the switch. What this asserts is the ORDER and
+    // the two marks the card renders — the card itself is covered by
+    // `workspace-picker.spec.ts` and the plugin suite.
     releases = 0
     const { store } = createStore({ entries: { chat: '/srv/alpha' } })
-    const reply = await runWorkspaceCommand('ws', '/ws', 'chat', store, release)
-    expect(reply).toContain(`\`${basename('/srv/default')}\``)
-    expect(reply).toContain('默认')
-    expect(reply).toContain('/srv/alpha')
-    expect(reply).toContain('当前')
+    const choices = workspaceChoices(store, 'chat')
+    expect(choices.map(choice => choice.path)).toEqual(['/srv/alpha', '/srv/default'])
+    expect(choices.find(choice => choice.path === '/srv/alpha')?.current).toBe(true)
+    expect(choices.find(choice => choice.isDefault)?.path).toBe('/srv/default')
   })
 })

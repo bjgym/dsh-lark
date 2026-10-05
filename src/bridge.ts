@@ -27,6 +27,7 @@ import {
   settledPermissionCard,
   toast,
   TOAST,
+  workspacesCard,
 } from './cards.ts'
 import type { ResolvedConfig } from './config.ts'
 import type {
@@ -65,7 +66,17 @@ import { marked } from './clicks.ts'
 import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './maintenance.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
-import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import {
+  CD_COMMAND,
+  ChatWorkspaces,
+  runWorkspaceCommand,
+  workspaceActionValue,
+  workspaceChoices,
+  workspacePage,
+  WORKSPACE_ACTION,
+  WS_COMMAND,
+} from './workspace.ts'
+import type { WorkspaceActionValue } from './workspace.ts'
 import {
   ChatSessionPicks,
   offerSessions,
@@ -287,6 +298,17 @@ const BACKGROUND_DRAIN_ROUNDS = 3
  */
 const BACKGROUND_DRAIN_MS = 5_000
 
+/**
+ * A promise that never settles, used to drop a losing branch out of a race.
+ *
+ * An approval is offered on two surfaces at once and the first answer wins. A
+ * branch that FAILS must not decide, and returning `undefined` from its
+ * rejection handler would settle the race immediately with nothing — refusing a
+ * question the other surface can still answer. Dropping out is expressed as a
+ * promise that never settles.
+ */
+const NEVER_SETTLES = new Promise<never>(() => {})
+
 interface PendingApproval {
   readonly chatId: string
   readonly chatType: string
@@ -307,6 +329,15 @@ interface PendingApproval {
   state: 'sending' | 'open' | 'settled'
   outcome?: HostApprovalOutcome | undefined
   decidedBy?: string | undefined
+  /**
+   * Whether the decision came from another surface rather than a press here.
+   *
+   * The same question is offered in the chat AND to whatever answerer follows
+   * this listener — the Web app's, in the deployment this was built for — and
+   * whichever decides first wins. When the other one wins, the card must not
+   * credit a press that never happened.
+   */
+  decidedElsewhere?: boolean | undefined
   settle(outcome: HostApprovalOutcome): void
   /** Detaches the abort listener, so a settled question leaks no handler. */
   removeAbort?: (() => void) | undefined
@@ -379,10 +410,22 @@ function approvalCard(
  * @param decidedBy - who pressed, when a person did. Named rather than
  * withheld: with approvals open to a room, the room should see whose press
  * granted the escalation.
+ * @param decidedElsewhere - whether another surface answered instead, in which
+ * case there is no press here to name.
  * @returns a Feishu card object for `updateCard`.
  */
-function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?: string): object {
-  return buildSettledApprovalCard({ toolName, outcome, decidedBy })
+function settledCard(
+  toolName: string,
+  outcome: HostApprovalOutcome,
+  decidedBy?: string,
+  decidedElsewhere?: boolean,
+): object {
+  return buildSettledApprovalCard({
+    toolName,
+    outcome,
+    ...decidedBy === undefined ? {} : { decidedBy },
+    ...decidedElsewhere === true ? { decidedElsewhere: true } : {},
+  })
 }
 
 /**
@@ -1722,7 +1765,7 @@ export function installBridge(
         const release = releaseFor(key)
         const subject = subjectOf(msg)
         let reply: { markdown: string } | { card: object }
-        if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
+        if (channelCommand === CD_COMMAND) {
           // A directory change is a session change, so it also ends any pick:
           // otherwise the conversation would move to a new workspace and go on
           // talking to the session it was told to continue in the old one. It
@@ -1734,6 +1777,12 @@ export function installBridge(
             await release()
           }
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, moved) }
+        } else if (channelCommand === WS_COMMAND) {
+          // Answered with the picker's first page. Reading the list and drawing
+          // it touch no session log, so this stays far inside the command's own
+          // budget — and a press on a row is what performs the switch, through
+          // the same `switch()` a typed `/cd` reaches.
+          reply = { card: workspacePicker(subject).card }
         } else if (channelCommand === NEW_COMMAND) {
           // Same reason, more bluntly: `/new` asks for a session that has no
           // history, which is the opposite of continuing one.
@@ -1953,7 +2002,7 @@ export function installBridge(
       toolName: request.toolName,
       agent: request.agent,
       call,
-      paint: (outcome, decidedBy) => settledCard(request.toolName, outcome, decidedBy),
+      paint: (outcome, decidedBy) => settledCard(request.toolName, outcome, decidedBy, pending.decidedElsewhere),
       state: 'sending',
       settle: resolveOutcome,
       removeAbort: () => { request.signal?.removeEventListener('abort', onAbort) },
@@ -1987,7 +2036,46 @@ export function installBridge(
       }
       pendingApprovals.delete(id)
     }
-    return settled
+
+    // The card is up, so the question is now live in TWO places: this card, and
+    // whatever answerer comes after this listener — the Web app's, in the
+    // deployment this was built for. Both are shown and whichever decides first
+    // is the answer, so the two are raced rather than ranked. That is the whole
+    // point: a person at the keyboard answers where they are, and a person away
+    // from it answers from the chat, without either surface taking the decision
+    // away from the other.
+    //
+    // Racing is why `next()` is called at all here, and two consequences come
+    // with it, both accepted:
+    //  - a deployment with no browser attached leaves the forwarded request
+    //    pending on the host, because the gateway settles an undelivered request
+    //    only when a client replies or the request's own lifetime ends. It is
+    //    released with the agent, so it cannot accumulate past one session.
+    //  - the browser keeps its own buttons after the chat answers, since that UI
+    //    belongs to the host. Its own settled check makes a later press inert.
+    const viaWeb = next().then(
+      // 'unavailable' is not a decision: it is the waterfall reporting that no
+      // answerer took the question, and the innermost chain resolves with it the
+      // moment the chain runs out. Treating it as a winner would let a chat card
+      // that is still on screen lose to a chain that declined to answer — the
+      // press would be discarded and the tool refused. It drops out instead.
+      outcome => outcome === 'unavailable' ? NEVER_SETTLES : { from: 'web' as const, outcome },
+      // A Web branch that throws did not decide either, and the card is still
+      // live. Dropping out is expressed as a promise that never settles.
+      () => NEVER_SETTLES,
+    )
+    const winner = await Promise.race([
+      settled.then(outcome => ({ from: 'chat' as const, outcome })),
+      viaWeb,
+    ])
+    if (winner.from === 'chat') return winner.outcome
+    // The Web app decided first. Retire the chat's card, saying where the
+    // decision actually came from rather than crediting a press that never
+    // happened here. `settleApproval` is idempotent, so an answer that landed
+    // in the same tick is left as it stands.
+    pending.decidedElsewhere = true
+    settleApproval(id, winner.outcome)
+    return winner.outcome
   }
 
   /**
@@ -2240,6 +2328,8 @@ export function installBridge(
     if (preset !== undefined) return switchPresetFromCard(preset, evt)
     const session = sessionActionValue(evt.action.value)
     if (session !== undefined) return continueSession(session, evt)
+    const workspace = workspaceActionValue(evt.action.value)
+    if (workspace !== undefined) return handleWorkspaceAction(workspace, evt)
     const refresh = statusActionValue(evt.action.value)
     if (refresh !== undefined) {
       const refusal = refuseControlClick(refresh, evt)
@@ -2367,6 +2457,69 @@ export function installBridge(
     }
     await port.send(chatId, { text: presetHeldText(preset) }).catch(reportSendFailure)
     spawn(pending.then(say))
+  }
+
+  /**
+   * Act on one press of the workspace picker: switch, or turn a page.
+   *
+   * Both travel as one payload kind, so this is the single arm that reaches
+   * either. A page control changes nothing but what is drawn — no switch, no
+   * release, no pick is retired — which is what makes paging safe to press
+   * repeatedly while deciding.
+   *
+   * A row goes through {@link ChatWorkspaces.switch}, the same call a typed
+   * `/cd` makes, so every guard a typed path faces — the directory must exist,
+   * it must not be a filesystem root or a home directory, it must sit under the
+   * configured roots — applies unchanged. The payload's path is not trusted;
+   * it is re-probed. What the picker adds is that the directory is usually one
+   * the channel already knows, so the press cannot fail for a typo.
+   * @param value - the payload the pressed row or control carried.
+   * @param evt - the click, for authorization and the operator log.
+   * @returns the toast and the repainted picker.
+   */
+  const handleWorkspaceAction = async (
+    value: WorkspaceActionValue,
+    evt: CardActionEvent,
+  ): Promise<CardActionResponse> => {
+    const refusal = refuseControlClick(value, evt)
+    if (refusal !== undefined) {
+      notify(`lark-channel: rejected a workspace switch: ${refusal}`)
+      return { toast: toast('error', TOAST.notYours) }
+    }
+    if (value.path === undefined) {
+      const painted = workspacePicker(subjectOfValue(value), value.page ?? 0)
+      return { card: { type: 'raw', data: painted.card } }
+    }
+    const before = conversationStamp(value.key)
+    const release = releaseFor(value.key)
+    const result = await chatWorkspaces.switch(value.key, value.path)
+    if (!result.ok) {
+      notify(`lark-channel: rejected a workspace switch in ${value.key}: ${result.reason}`)
+      return {
+        toast: toast('error', TOAST.workspaceRefused),
+        card: { type: 'raw', data: workspacePicker(subjectOfValue(value)).card },
+      }
+    }
+    if (!result.changed) {
+      return {
+        toast: toast('info', TOAST.workspaceSame),
+        card: { type: 'raw', data: workspacePicker(subjectOfValue(value)).card },
+      }
+    }
+    // The directory moved, so this conversation's next message must walk the
+    // ladder under the new id: the pick it may have been holding points at a
+    // session in the directory it just left, and the cached session list is a
+    // list of THAT directory's sessions.
+    await chatSessionPicks.set(value.key, undefined)
+    lastOffered.delete(value.key)
+    if (conversationStamp(value.key) !== before) notify(`lark-channel: ${value.key} moved twice quickly`)
+    await release()
+    diag('info', `lark-channel: ${value.key} switched workspace to ${result.path}`)
+    notify(`lark-channel: ${value.key} switched to ${result.path}`)
+    return {
+      toast: toast('success', TOAST.workspaceSwitched),
+      card: { type: 'raw', data: workspacePicker(subjectOfValue(value)).card },
+    }
   }
 
   /**
@@ -2541,6 +2694,41 @@ export function installBridge(
   /** The host's session-query engine, when this deployment composed one. */
   const sessionQuery = (): HostSessionQuery | undefined =>
     ctx.get('sessionQuery') as HostSessionQuery | undefined
+
+  /**
+   * The workspace picker: which directory this conversation runs in, and one
+   * press each for the rest.
+   *
+   * Reads nothing but channel state — the known paths are the default, what
+   * this conversation switched to, and what the host registry lists — so both
+   * drawing it and turning a page answer in well under the callback budget.
+   * @param subject - the conversation the card is built for.
+   * @param page - the zero-based page to draw; out-of-range values clamp.
+   * @returns the card to send, and the page it drew.
+   */
+  const workspacePicker = (
+    subject: ConversationSubject,
+    page = 0,
+  ): { readonly card: object; readonly page: number } => {
+    const choices = workspaceChoices(chatWorkspaces, subject.key)
+    const sliced = workspacePage(choices, page)
+    const card_ = workspacesCard({
+      rows: sliced.rows,
+      page: sliced.page,
+      pages: sliced.pages,
+      current: chatWorkspaces.pathFor(subject.key),
+      // Both a row and a page control travel as this one payload kind, so the
+      // dispatcher has a single arm to reach and a foreign card cannot forge
+      // either: the mark is minted per rendering, and the fields are validated.
+      valueFor: target => marked({
+        kind: WORKSPACE_ACTION,
+        ...subject,
+        ...target.path === undefined ? {} : { path: target.path },
+        ...target.page === undefined ? {} : { page: target.page },
+      }),
+    })
+    return { card: card_, page: sliced.page }
+  }
 
   /**
    * Sessions the operator archived, which no surface should offer.

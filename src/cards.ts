@@ -480,6 +480,11 @@ const APPROVAL = {
   summary: { zh: '需要授权：%s', en: 'Approval needed: %s' },
   closed: { zh: '这条授权已结束，按钮不再可用。', en: 'This request is closed; its buttons no longer work.' },
   decidedBy: { zh: '%s · 决定人：', en: '%s · decided by ' },
+  // The same question is offered on more than one surface, and the one that
+  // answers first wins. A card the OTHER surface answered must say so: the room
+  // would otherwise read a decision it never made, or look for who pressed a
+  // button nobody here pressed.
+  decidedElsewhere: { zh: '%s · 已在网页端决定', en: '%s · decided in the web app' },
 }
 const QUESTION = {
   title: { zh: '需要你确认', en: 'A decision is needed' },
@@ -573,13 +578,19 @@ export function settledApprovalCard(input: {
   readonly toolName: string
   readonly outcome: string
   readonly decidedBy?: string | undefined
+  /** Whether another surface answered, so no press happened here. */
+  readonly decidedElsewhere?: boolean | undefined
 }): object {
   const settled = APPROVAL_OUTCOME[input.outcome] ?? APPROVAL_OUTCOME.cancelled!
   // Who decided, named rather than withheld: with approvals open to a room,
-  // the room should see whose press granted the escalation.
-  const context = input.decidedBy === undefined || input.decidedBy === ''
-    ? input.toolName
-    : join(fill(APPROVAL.decidedBy, input.toolName), input.decidedBy)
+  // the room should see whose press granted the escalation. When the decision
+  // came from the other surface there is no name to give, and naming the wrong
+  // one would be worse than naming none — the card says where it came from.
+  const context = input.decidedElsewhere === true
+    ? fill(APPROVAL.decidedElsewhere, input.toolName)
+    : input.decidedBy === undefined || input.decidedBy === ''
+      ? input.toolName
+      : join(fill(APPROVAL.decidedBy, input.toolName), input.decidedBy)
   return card(settled.state, join(settled.title, `：${input.toolName}`, `: ${input.toolName}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),
@@ -1106,6 +1117,118 @@ export function sessionsCard(input: {
 }
 
 /**
+ * Every string the workspace picker says.
+ *
+ * The footer names `/cd` explicitly: the picker can only offer directories this
+ * channel already knows, and a directory nobody has used with the host yet has
+ * no row — so the typed form is not a leftover, it is the only way to reach a
+ * new project.
+ */
+const WORKSPACES = {
+  title: { zh: '工作区', en: 'Workspaces' },
+  context: { zh: '本会话在 %s', en: 'This conversation is in %s' },
+  current: { zh: '当前', en: 'Current' },
+  isDefault: { zh: '默认', en: 'Default' },
+  empty: {
+    zh: '这里还没有可用的工作区，用 `/cd <绝对路径>` 指定一个。',
+    en: 'No workspaces to offer yet — name one with `/cd <absolute path>`.',
+  },
+  elsewhere: { zh: '管理面板正在使用', en: 'Open in the console' },
+  previous: { zh: '上一页', en: 'Previous' },
+  next: { zh: '下一页', en: 'Next' },
+  position: { zh: '第 %s / %s 页', en: 'Page %s of %s' },
+  foot: {
+    zh: '点一行切换到这个目录；新目录用 `/cd <绝对路径>`。',
+    en: 'Press a row to switch there; reach a new directory with `/cd <absolute path>`.',
+  },
+  summary: { zh: '工作区', en: 'Workspaces' },
+}
+
+/** One row of the workspace picker, as the bridge resolves it. */
+export interface WorkspaceCardRow {
+  readonly path: string
+  readonly name: string
+  readonly isDefault: boolean
+  readonly current: boolean
+}
+
+/**
+ * The workspace picker: which directory this conversation runs in, and where
+ * else it could.
+ *
+ * Ids are carried by the buttons and never printed, exactly as the session
+ * picker does it: a full path is miserable to transcribe on the phone this is
+ * mostly used from. The current row states itself instead of offering a press,
+ * so the card always says where the conversation is — which is why that row is
+ * pinned to the first page rather than left wherever it sorted.
+ * @param input - the rows, the page they were taken from, and each row's payload.
+ * @returns a schema 2.0 card object.
+ */
+export function workspacesCard(input: {
+  readonly rows: readonly WorkspaceCardRow[]
+  readonly page: number
+  readonly pages: number
+  readonly current: string
+  readonly valueFor: (choice: { readonly path?: string; readonly page?: number }) => object
+}): object {
+  /**
+   * One directory as a pressable row: the name a reader recognizes, then the
+   * full path that tells two directories of one name apart.
+   */
+  const rowFor = (row: WorkspaceCardRow): object => {
+    const notes = [
+      ...row.current ? [WORKSPACES.current] : [],
+      ...row.isDefault ? [WORKSPACES.isDefault] : [],
+    ]
+    const detail: Line = {
+      zh: [row.path, ...notes.map(note => note.zh)].join(' · '),
+      en: [row.path, ...notes.map(note => note.en)].join(' · '),
+    }
+    return row.current
+      ? settledRow(row.name, detail, WORKSPACES.current, INK.info.token)
+      : optionRow({ label: row.name, description: detail }, input.valueFor({ path: row.path }))
+  }
+
+  /**
+   * The page strip. Drawn only where there is more than one page, so a
+   * deployment with a handful of workspaces reads as a plain list rather than
+   * as a list with controls that do nothing.
+   */
+  const pager = (): object[] => {
+    if (input.pages <= 1) return []
+    const controls = [
+      ...input.page > 0
+        ? [optionRow({ label: WORKSPACES.previous }, input.valueFor({ page: input.page - 1 }))]
+        : [],
+      ...input.page < input.pages - 1
+        ? [optionRow({ label: WORKSPACES.next }, input.valueFor({ page: input.page + 1 }))]
+        : [],
+    ]
+    return [
+      line(
+        {
+          zh: `第 ${input.page + 1} / ${input.pages} 页`,
+          en: `Page ${input.page + 1} of ${input.pages}`,
+        },
+        SIZE.label,
+        '14px 20px 0px 20px',
+        'grey',
+      ),
+      ...controls,
+    ]
+  }
+
+  return card('info', WORKSPACES.summary, [
+    ...heading('info', WORKSPACES.title, fill(WORKSPACES.context, workspaceLabel(input.current))),
+    ...input.rows.length === 0
+      ? [line(WORKSPACES.empty, SIZE.body, '14px 20px 0px 20px', 'grey')]
+      : input.rows.map(rowFor),
+    ...pager(),
+    ...footer(WORKSPACES.foot),
+  ])
+}
+
+/**
  * A workspace as a subtitle names it: the last two path segments.
  *
  * A whole absolute path in a subtitle is longer than the title, wraps on a
@@ -1137,6 +1260,9 @@ export const TOAST = {
   sessionSwitched: { zh: '已切过去，下一条消息接续', en: 'Switched — your next message continues it' },
   sessionOwn: { zh: '已回到这个聊天自己的会话', en: "Back on this chat's own session" },
   sessionGone: { zh: '这个会话已经不在可接续列表里了', en: 'That session is no longer on offer here' },
+  workspaceSwitched: { zh: '已切换工作区，下一条消息在新目录', en: 'Workspace switched — your next message runs there' },
+  workspaceSame: { zh: '本会话已经在这个目录', en: 'This conversation already runs there' },
+  workspaceRefused: { zh: '这个目录不能用作工作区', en: 'That directory cannot be a workspace' },
   presetFailed: { zh: '切换失败，看操作台日志', en: 'The switch failed; see the operator console' },
   presetQueued: {
     zh: '已记下，当前这轮任务结束后生效',
