@@ -1119,6 +1119,16 @@ export function installBridge(
 
   const agents = ctx.agents as DurableAgentRegistry
 
+  /**
+   * Why the last resume of one session id was rejected.
+   *
+   * The ladder's `resume` can only return a handle or throw, so the rejection
+   * travels to the `create` rung — the one place a picked id lands and the only
+   * place with a human to tell — through this map rather than through the
+   * signature. Entries are removed as they are reported.
+   */
+  const resumeFailure = new Map<string, string>()
+
   const ladder: SessionLadder = {
     lookup: (sessionId) => {
       const agent = agents.get(sessionId)
@@ -1127,18 +1137,27 @@ export function installBridge(
     },
     resume: async (sessionId) => {
       const composition = await compositionFor(sessionId)
-      const handle = await agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
-        setup: composition.setup,
-      })
-      // Resuming publishes too. A chat that already has a durable session
-      // NEVER takes the create rung again, so publishing only from there froze
-      // the panel at whatever this channel offered the day that session began:
-      // every command added afterwards existed, worked when typed, and was
-      // invisible to everyone who reached for `/`.
-      publishSlashPanel(handle.agent)
-      return handle
+      try {
+        const handle = await agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
+          setup: composition.setup,
+        })
+        // Resuming publishes too. A chat that already has a durable session
+        // NEVER takes the create rung again, so publishing only from there froze
+        // the panel at whatever this channel offered the day that session began:
+        // every command added afterwards existed, worked when typed, and was
+        // invisible to everyone who reached for `/`.
+        publishSlashPanel(handle.agent)
+        return handle
+      } catch (error: unknown) {
+        // Kept for the create rung, which is where a picked id lands and the
+        // only place that can report the reason to a human. The registry's
+        // rejection is otherwise lost: this signature returns a handle, not a
+        // result, so the ladder's next rung sees only that it failed.
+        resumeFailure.set(sessionId, failureDetail(error))
+        throw error
+      }
     },
     create: async (sessionId) => {
       // A picked session is one this conversation was told to CONTINUE, so it
@@ -1150,8 +1169,15 @@ export function installBridge(
       const picking = chatSessionPicks.keysPicking(sessionId)
       if (picking.length > 0) {
         for (const key of picking) await chatSessionPicks.set(key, undefined)
-        notify(`lark-channel: ${sessionId} could not be resumed; retired the pick held by ${picking.join(', ')}`)
-        throw new Error('这个会话打不开了（日志可能已损坏或版本不兼容），已回到本聊天自己的会话。再发一条消息即可继续。')
+        // The resume rejection is the ONLY account of why this failed, and it
+        // used to be dropped here in favour of a guess about a corrupt log —
+        // which sent an operator looking for damage that was not there when the
+        // real cause was a session this surface may not open at all.
+        const reason = resumeFailure.get(sessionId) ?? 'the session could not be loaded'
+        resumeFailure.delete(sessionId)
+        diag('warn', `lark-channel: resume failed for ${sessionId}: ${reason}`)
+        notify(`lark-channel: ${sessionId} could not be resumed (${reason}); retired the pick held by ${picking.join(', ')}`)
+        throw new Error(`这个会话在这里打不开：${reason}\n已回到本聊天自己的会话，再发一条消息即可继续。`)
       }
       const composition = await compositionFor(sessionId)
       // The workspace's own canonical path, so `attachSession` finds the header
@@ -2367,10 +2393,28 @@ export function installBridge(
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
     const before = conversationStamp(value.key)
-    const offered = await offeredSessions(value.key)
+    // ONE derivation per press, shared by the authorization check and the
+    // repaint. Deriving twice was the original shape and it is what timed the
+    // platform's callback out: the list is read from every candidate's whole
+    // log — one workspace here holds a 47 MB session — so a second derivation
+    // doubles a cost that already ran past the callback's budget. Deriving not
+    // at all is equally wrong: the rows a press may name are exactly the rows
+    // this list draws, and the paint has to come from the same answer.
+    const offered = await cachedOfferedSessions(value.key)
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
       notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
+      return {
+        toast: toast('info', TOAST.sessionGone),
+        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+      }
+    }
+    // The workspace still has to be the one this row was offered under. A card
+    // outlives the conversation's directory: `/cd` moves it, and a press on the
+    // older card would otherwise continue a session from the directory the chat
+    // has left — the exact sandbox move the picker filters against.
+    if (value.workspace !== undefined && value.workspace !== chatWorkspaces.pathFor(value.key)) {
+      notify(`lark-channel: ${value.key} left ${value.workspace} since that card was drawn`)
       return {
         toast: toast('info', TOAST.sessionGone),
         card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
@@ -2391,16 +2435,27 @@ export function installBridge(
       notify(`lark-channel: ${value.key} moved while a session switch was in flight`)
       return {
         toast: toast('info', TOAST.sessionGone),
-        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value)) },
+        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
       }
     }
     await chatSessionPicks.set(value.key, choice.id === derived ? undefined : choice.id)
+    // Dropped rather than updated: the rows themselves are unchanged, but one of
+    // them just became the current one, and a cached list would paint the card
+    // with the row the person moved TO still looking like an option. The next
+    // derivation is the fresh answer, and nothing between here and then needs the
+    // old one.
+    lastOffered.delete(value.key)
+    // Recorded, not just announced: the press succeeds and the failure arrives
+    // later, on the next message, when the pick is finally resumed. Without this
+    // line an operator sees a switch that reported success and a chat that then
+    // refused to continue, with nothing tying the two together.
+    diag('info', `lark-channel: ${value.key} picked ${choice.id === derived ? 'its own session' : choice.id}`)
     notify(`lark-channel: ${value.key} continues ${choice.id}`)
     return {
       toast: toast('success', choice.id === derived ? TOAST.sessionOwn : TOAST.sessionSwitched),
-      // Repainted from the list this press was authorized against: the facts
+      // Painted from the derivation this press was authorized against: the facts
       // behind each row cannot have changed in between, and the one thing that
-      // did — which row is current — is read fresh below.
+      // did — which row is current — is read fresh inside.
       card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
     }
   }
@@ -2432,8 +2487,7 @@ export function installBridge(
    * The picker for one conversation: what it may continue, and one press each.
    *
    * Everything the card offers is resolved here, because the list IS the
-   * authorization — a row that never appears cannot be pressed, and the click
-   * handler re-derives the same list rather than trusting the payload's id.
+   * authorization — a row that never appears cannot be pressed.
    * @param subject - the conversation the card is built for.
    * @param line - the command line, so a keyword can narrow the list.
    * @param derived - a list already derived for this conversation, to repaint
@@ -2446,7 +2500,7 @@ export function installBridge(
     derived?: OfferedSessions,
   ): Promise<object> => {
     const keyword = line.trimStart().replace(/^\/\S+\s*/, '').trim()
-    const offered = derived ?? await offeredSessions(subject.key, keyword)
+    const offered = derived ?? await cachedOfferedSessions(subject.key, keyword)
     const current = sessionIdOf(subject.key)
     return sessionsCard({
       rows: offered.rows.map(choice => ({
@@ -2473,7 +2527,14 @@ export function installBridge(
       // carries one — the click handler repaints from the value it was given —
       // and spreading that over the row would point every button at the
       // session someone just pressed.
-      valueFor: session => marked({ kind: SESSIONS_ACTION, ...subject, session }),
+      valueFor: session => marked({
+        kind: SESSIONS_ACTION,
+        ...subject,
+        session,
+        // The workspace each row was offered under, so a press is authorized
+        // against what the card actually showed without re-deriving the list.
+        workspace: chatWorkspaces.pathFor(subject.key),
+      }),
     })
   }
 
@@ -2492,6 +2553,53 @@ export function installBridge(
   const archivedSessions = (): ReadonlySet<string> => {
     const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
     return new Set(registry?.archivedSessionIds ?? [])
+  }
+
+  /**
+   * The last list derived for one conversation, and what it was derived under.
+   *
+   * A derivation is expensive out of proportion to what it returns: listing the
+   * corpus re-reads every session's HEADER, and this deployment holds 233 of
+   * them behind zstd — measured at about three seconds, nearly all of it in the
+   * listing rather than in the per-candidate reads. A card callback has a budget
+   * of a few seconds and the platform drops one that overruns, which the presser
+   * sees as "the callback service timed out".
+   *
+   * So a press reuses the list its own card was drawn from, whenever that list
+   * still describes this conversation. The stamp is the guard: `/cd`, `/new` and
+   * a pick all move it, and a stale entry is discarded rather than reused.
+   */
+  const lastOffered = new Map<string, { readonly stamp: string; readonly at: number; readonly offered: OfferedSessions }>()
+
+  /**
+   * How long a derivation stays reusable.
+   *
+   * Long enough to cover the gap between a card being drawn and pressed — which
+   * includes composing a turn, so seconds rather than milliseconds — and short
+   * enough that a list is never materially out of date.
+   */
+  const OFFERED_TTL_MS = 120_000
+
+  /**
+   * What this conversation may continue, reusing a derivation still in date.
+   *
+   * A keyword always derives: its answer is not what any cached one holds.
+   * @param key - the conversation key.
+   * @param keyword - optional filter over titles and ids.
+   * @returns the rows to offer and the hidden count.
+   */
+  const cachedOfferedSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
+    if (keyword !== '') return offeredSessions(key, keyword)
+    const entry = lastOffered.get(key)
+    if (entry !== undefined && entry.stamp === conversationStamp(key) && Date.now() - entry.at < OFFERED_TTL_MS) {
+      return entry.offered
+    }
+    const offered = await offeredSessions(key, keyword)
+    // Stamped AFTER the derivation, not before: a `/cd` landing while it ran must
+    // not be recorded as this list's basis, or the next press would reuse rows
+    // from the directory the conversation has left.
+    lastOffered.set(key, { stamp: conversationStamp(key), at: Date.now(), offered })
+    return offered
   }
 
   /**

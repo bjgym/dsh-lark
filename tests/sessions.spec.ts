@@ -176,6 +176,28 @@ describe('the payload a row carries', () => {
     expect(sessionActionValue({ ...value, key: undefined })).toBeUndefined()
     expect(sessionActionValue(null)).toBeUndefined()
   })
+
+  it('carries the workspace the row was offered under, and drops a non-string one', () => {
+    // The press is authorized against this value instead of re-deriving the
+    // list, which is what used to time the platform's callback out.
+    const value = {
+      kind: SESSIONS_ACTION, session: 'session-x', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+      workspace: '/work',
+    }
+    expect(sessionActionValue(value)).toEqual(value)
+    expect(sessionActionValue({ ...value, workspace: 7 })).toBeUndefined()
+  })
+
+  it('accepts a session id this channel did not mint', () => {
+    // The rows a person presses are Web UI sessions named `session-…`, not the
+    // channel's own `lark-…` ids. A switch that required the channel's prefix
+    // refused every real row with "you may not change this conversation".
+    const value = {
+      kind: SESSIONS_ACTION, session: 'session-13690074-5cbe-4801-9408-0fbe983677e6',
+      key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+    }
+    expect(sessionActionValue(value)?.session).toBe('session-13690074-5cbe-4801-9408-0fbe983677e6')
+  })
 })
 
 describe('what makes one session recognizable', () => {

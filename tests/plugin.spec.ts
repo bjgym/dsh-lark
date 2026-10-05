@@ -3316,7 +3316,7 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('derives the list once per press, and repaints from what it authorized', async () => {
+    it('reuses the card\'s own derivation for a press, and repaints from it', async () => {
       const { query, listed } = createFakeSessionQuery([
         {
           id: 'session-web-ui',
@@ -3333,10 +3333,16 @@ describe('dsh-lark-channel', () => {
 
       await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
 
-      // One derivation: it authorizes the press AND paints the answer. The
-      // facts behind a row cannot change in between; only which row is
-      // current, and that is read fresh.
-      expect(listed.length - before).toBe(1)
+      // NO derivation at all: the press reuses the list its own card was drawn
+      // from, which still describes this conversation. A derivation re-reads
+      // every session header — 233 of them behind zstd here, measured near
+      // three seconds — and a card callback that overruns its budget is dropped
+      // by the platform as an unanswered press. The repaint still comes from
+      // that same list, and the row it marks current is read fresh.
+      expect(listed.length - before).toBe(0)
+      const repaintable = (harness.fake.updated.at(-1) as { card?: object } | undefined)?.card
+        ?? (harness.fake.sent.at(-1)!.input as { card: object }).card
+      expect(cardControls(repaintable).length).toBeGreaterThan(0)
       await harness.dispose()
     })
 
@@ -3397,7 +3403,10 @@ describe('dsh-lark-channel', () => {
 
       // The session is NOT resumable here: the log will not load.
       await harness.fake.emitMessage(fakeMessage({ content: 'go on' }))
-      await vi.waitFor(() => { expect(sentText(harness)).toContain('打不开了') })
+      // The chat says the session cannot be opened HERE, and carries the
+      // registry's own reason rather than guessing at a corrupt log.
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('在这里打不开') })
+      expect(sentText(harness)).toContain('已回到本聊天自己的会话')
       expect(harness.agents.made).not.toContain('session-web-ui')
 
       // And the pick is retired rather than left to fail forever: the next

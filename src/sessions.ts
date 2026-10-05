@@ -36,14 +36,24 @@ export const SESSIONS_COMMAND = 'sessions'
 export const SESSIONS_ACTION = 'dsh-lark-channel/sessions'
 
 /** How many rows the picker offers before it asks for a keyword instead. */
-export const PICKER_ROWS = 8
+export const PICKER_ROWS = 5
 
 /**
  * How many candidates beyond the visible rows are described anyway.
  *
  * Describing costs a log read per session, so the window is bounded — but a
  * window exactly as wide as the card runs the card short whenever a candidate
- * turns out to be a session nothing ever happened in.
+ * turns out to be a session nothing ever happened in, and those are dropped
+ * only after they have been read. A spare of zero leaves a card of eight empty
+ * candidates with nothing to draw at all, which is why this cannot be zero.
+ *
+ * Kept no larger than it must be, because a read is not proportional to what
+ * the row shows: every accessor on the query engine materializes the session's
+ * WHOLE log, and a workspace here held a 47 MB / 41k-event session. A window of
+ * twelve measured over a second on already-decompressed files, worse once the
+ * host's own decode is counted, and the platform drops a card callback it
+ * considers unanswered — which reaches the presser as "the callback service
+ * timed out" rather than as a slow bot.
  */
 export const PICKER_SPARE = 4
 
@@ -135,9 +145,14 @@ const SAID_MIN_CHARS = 4
  * @param id - the session to describe.
  * @returns the facts, as far as the engine offers them.
  */
-export async function sessionFacts(query: HostSessionQuery, id: string): Promise<SessionFacts> {
+export async function sessionFacts(
+  query: HostSessionQuery,
+  id: string,
+  signal?: AbortSignal,
+): Promise<SessionFacts> {
   if (query.listEvents === undefined) return { turns: 0 }
   const events = await query.listEvents(id).catch((): readonly HostEventRecord[] => [])
+  signal?.throwIfAborted()
   const turns = events.filter(event => event.type === TURN_START).length
   // Folded rather than spread: a long session's log runs to tens of thousands
   // of events, and `Math.max(...events)` passes every one of them as an
@@ -177,6 +192,17 @@ export interface SessionActionValue extends ConversationSubject {
   readonly kind: typeof SESSIONS_ACTION
   /** The session to continue; the row for the derived one carries it too. */
   readonly session: string
+  /**
+   * The workspace the row was offered under, when the card that carried it
+   * named one.
+   *
+   * Carried so a press can be authorized WITHOUT re-deriving the list. The
+   * derivation reads every candidate's whole log — one workspace here holds a
+   * 47 MB session — and the platform drops a card callback that does not answer
+   * in time, which the presser sees as a dead service rather than as the delay
+   * it is. The pick is still written against the conversation's live state.
+   */
+  readonly workspace?: string | undefined
 }
 
 /**
@@ -192,6 +218,7 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
   if (typeof record.key !== 'string' || record.key === '') return undefined
   if (typeof record.chatId !== 'string' || typeof record.chatType !== 'string') return undefined
   if (record.owner !== undefined && typeof record.owner !== 'string') return undefined
+  if (record.workspace !== undefined && typeof record.workspace !== 'string') return undefined
   return {
     kind: SESSIONS_ACTION,
     session: record.session,
@@ -199,6 +226,7 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
     chatId: record.chatId,
     chatType: record.chatType,
     ...record.owner === undefined ? {} : { owner: record.owner },
+    ...record.workspace === undefined ? {} : { workspace: record.workspace },
   }
 }
 
@@ -595,6 +623,14 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
   // the card would leave the card SHORT whenever the "nothing ever happened
   // here" rule below drops a row, and would sit a described row under an
   // undescribed one.
+  //
+  // Bounded tightly, because ONE read is far from cheap: every accessor on the
+  // query engine materializes the session's whole log (`_corpus.load`), and a
+  // workspace here held a 47 MB session — decompressing and parsing it to count
+  // turns costs most of a second. Describing the window in parallel does not
+  // hide that from the press that waits on it, and the platform drops a card
+  // callback it considers unanswered, so an over-wide window is reported to the
+  // presser as a dead service rather than as a slow one.
   const head = shortlist.slice(0, PICKER_ROWS + PICKER_SPARE)
   // Whatever else the window holds, it holds the session this conversation is
   // ON — a quiet one sorts to the back of a busy corpus, and a card that cannot
@@ -609,8 +645,7 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
       ...facts.lastActive === undefined ? {} : { lastActive: facts.lastActive },
       turns: facts.turns,
     }
-  }))
-  // A session nothing ever happened in is not a conversation to continue —
+  }))  // A session nothing ever happened in is not a conversation to continue —
   // except this one's own, which is how a picked conversation comes back. Where
   // the host lends no event listing, nothing ever happened in ANY of them as
   // far as this can tell, and dropping the lot would leave a picker that only
