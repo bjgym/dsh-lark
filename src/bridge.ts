@@ -633,13 +633,27 @@ function composeChatAgent(
   // surface on whichever UI claimed the single `userQuestions` provider, while
   // the person who asked is here. Registered before the guard so a deployment
   // that also denies the name still denies it — configuration wins.
-  const shadowed = askQuestions !== undefined
+  // TEMPORARY PROBE — the shadow and its deny are switched off by config so the
+  // host's own `ask_user_question` can run and prove whether
+  // `user-questions/request` reaches this process at all. Remove this switch
+  // (and its Config field) once the question path is settled.
+  const probeHostQuestions = config.probeHostQuestions === true
+  const shadowed = !probeHostQuestions
+    && askQuestions !== undefined
     && !denied.has(QUESTION_TOOL)
     && tools?.register !== undefined
   if (shadowed) tools?.register?.(shadowQuestionTool(askQuestions))
   // A registry too old to shadow leaves the host's GUI-only tool in place;
   // denying it keeps the model from asking where no one is watching.
-  if (!shadowed && askQuestions !== undefined) denied.add(QUESTION_TOOL)
+  if (!shadowed && askQuestions !== undefined && !probeHostQuestions) denied.add(QUESTION_TOOL)
+  // TEMPORARY PROBE — remove once the question path is settled. Records which
+  // branch the composition took, which nothing else does: a shadow that never
+  // registered shows up only as a model that stopped using the tool. Written
+  // through the logger rather than the diagnostic sink, which this module-level
+  // function cannot see.
+  agentCtx.logger.warn('PROBE question shadow askQuestions=%s hasRegister=%s deniedByConfig=%s shadowed=%s',
+    askQuestions !== undefined, tools?.register !== undefined,
+    config.denyTools.includes(QUESTION_TOOL), shadowed)
 
   // The plan tool is shadowed for the same reason and on the same terms: its
   // review reaches for that same single-provider seam. Only worth registering
@@ -1041,6 +1055,15 @@ export function installBridge(
     sessionId: string | undefined,
   ): Promise<QuestionAnswer[]> => {
     const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
+    // TEMPORARY PROBE — remove with the others. The branch below answers EMPTY
+    // rather than throwing, so a question that never reached a chat is
+    // indistinguishable from one the user declined to answer. This records which
+    // it was, and whether the session id arrived at all.
+    diag('warn', 'PROBE question ask'
+      + ` sessionId=${sessionId ?? '(undefined)'}`
+      + ` binding=${binding === undefined ? 'MISS' : 'HIT'}`
+      + ` count=${asked.length}`
+      + ` ids=${asked.map(question => question.id).join(',')}`)
     if (binding === undefined || sessionId === undefined) {
       // No chat to ask in — answer empty rather than hang the turn.
       return asked.map(question => ({ id: question.id, selected: [] }))
@@ -1049,6 +1072,8 @@ export function installBridge(
     for (const question of asked) {
       answers.push(await questions.ask({ sessionId, chatId: binding.chatId, question }))
     }
+    diag('warn', `PROBE question answered count=${answers.length}`
+      + ` selected=${JSON.stringify(answers.map(answer => answer.selected))}`)
     return answers
   }
 
@@ -1795,7 +1820,12 @@ export function installBridge(
             release,
           })
         } else if (channelCommand === SESSIONS_COMMAND) {
-          reply = { card: await sessionPicker(subject, msg.content) }
+          // TEMPORARY PROBE — remove with the others. Times the whole command,
+          // which is what its own callback deadline covers.
+          const listingAt = Date.now()
+          const painted = await sessionPicker(subject, msg.content)
+          diag('warn', `PROBE /sessions key=${key} took=${Date.now() - listingAt}ms`)
+          reply = { card: painted }
         } else {
           reply = { card: renderStatusCard({ ...statusFieldsFor(subject), ...presetOf(subject) }, subject) }
         }
@@ -2546,6 +2576,9 @@ export function installBridge(
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
     const before = conversationStamp(value.key)
+    // TEMPORARY PROBE — remove with the one in `cachedOfferedSessions`. Times one
+    // whole press, which is what the platform actually gives a deadline.
+    const pressedAt = Date.now()
     // ONE derivation per press, shared by the authorization check and the
     // repaint. Deriving twice was the original shape and it is what timed the
     // platform's callback out: the list is read from every candidate's whole
@@ -2554,6 +2587,7 @@ export function installBridge(
     // at all is equally wrong: the rows a press may name are exactly the rows
     // this list draws, and the paint has to come from the same answer.
     const offered = await cachedOfferedSessions(value.key)
+    diag('warn', `PROBE press key=${value.key} session=${value.session} derive=${Date.now() - pressedAt}ms`)
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
       notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
@@ -2777,9 +2811,28 @@ export function installBridge(
    * @returns the rows to offer and the hidden count.
    */
   const cachedOfferedSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
-    if (keyword !== '') return offeredSessions(key, keyword)
+    // TEMPORARY PROBE — remove once the callback budget is settled. It exists to
+    // tell a cache HIT apart from a cold derivation in the diagnostic log, which
+    // the derivation's own report cannot: that report is only written when a
+    // derivation runs, so a press that reused one is invisible.
+    const why = (): string => {
+      if (keyword !== '') return `keyword="${keyword}"`
+      const entry = lastOffered.get(key)
+      if (entry === undefined) return 'no entry'
+      if (entry.stamp !== conversationStamp(key)) return 'stamp changed'
+      const age = Date.now() - entry.at
+      return age >= OFFERED_TTL_MS ? `expired after ${age}ms` : `fresh ${age}ms`
+    }
+    const reason = why()
+    const started = Date.now()
+    if (keyword !== '') {
+      const offered = await offeredSessions(key, keyword)
+      diag('warn', `PROBE derive keyword key=${key} took=${Date.now() - started}ms why=${reason}`)
+      return offered
+    }
     const entry = lastOffered.get(key)
     if (entry !== undefined && entry.stamp === conversationStamp(key) && Date.now() - entry.at < OFFERED_TTL_MS) {
+      diag('warn', `PROBE HIT key=${key} took=${Date.now() - started}ms why=${reason} rows=${entry.offered.rows.length}`)
       return entry.offered
     }
     const offered = await offeredSessions(key, keyword)
@@ -2787,6 +2840,7 @@ export function installBridge(
     // not be recorded as this list's basis, or the next press would reuse rows
     // from the directory the conversation has left.
     lastOffered.set(key, { stamp: conversationStamp(key), at: Date.now(), offered })
+    diag('warn', `PROBE MISS key=${key} took=${Date.now() - started}ms why=${reason} rows=${offered.rows.length}`)
     return offered
   }
 
@@ -3299,6 +3353,19 @@ export function installBridge(
     if (isTurnEndEvent(event)) aimAt(session.id, binding, undefined)
   })
 
+  // TEMPORARY PROBE — remove once the question path is settled, with the
+  // `probeHostQuestions` switch. Observes only: it never claims the request, so
+  // the Web app's own answerer still runs and its panel still appears. What it
+  // answers is whether this event reaches this process at all, which decides
+  // whether a chat card can join the Web panel instead of replacing it.
+  ctx.on('user-questions/request', (request, next) => {
+    const owner = request.agent?.session.id ?? '(no agent)'
+    diag('warn', `PROBE uq event agent=${owner} questions=${request.questions.length}`
+      + ` ids=${request.questions.map(question => question.id).join(',')}`
+      + ` timed=${request.wait?.timed === true}`)
+    return next()
+  })
+
   // Approval questions for owned agents become cards; everything else delegates.
   //
   // PREPEND is load-bearing. A host answerer may claim every audited request
@@ -3312,6 +3379,16 @@ export function installBridge(
   // listener still delegates every session it does not own.
   ctx.on('approval/request', (request, next) => {
     const binding = bySession.get(request.agent.session.id)
+    // TEMPORARY PROBE — remove with the others. A session this channel does not
+    // hold a binding for is answered entirely by the next listener, so a
+    // Web-driven turn in a conversation the chat has not touched yet produces no
+    // card. This records which it was, and names the session so the two can be
+    // told apart.
+    diag('warn', 'PROBE approval request'
+      + ` session=${request.agent.session.id}`
+      + ` binding=${binding === undefined ? 'MISS' : 'HIT'}`
+      + ` tool=${request.toolName}`
+      + ` bound=${[...bySession.keys()].join(',') || '(none)'}`)
     if (binding === undefined) return next()
     return askViaCard(binding, request, next)
   }, { prepend: true })

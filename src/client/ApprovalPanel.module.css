@@ -1,0 +1,65 @@
+/* The Lark approval takeover: the shipped panel's geometry with one extra
+   settled state. Tokens only — no literal colors (docs/web-styling.md). */
+
+.root {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 720px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-l2);
+  background: var(--dsw-alias-bg-base);
+}
+
+.strip {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-text-l2);
+  font-size: 12px;
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.headline {
+  color: var(--dsw-alias-text-l1);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.command {
+  color: var(--dsw-alias-text-l2);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.actionRow {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 8px 12px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+
+.reject {
+  margin-right: auto;
+}

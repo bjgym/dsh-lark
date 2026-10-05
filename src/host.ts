@@ -778,6 +778,19 @@ export function turnErrorDetail(data: TurnEndData): string {
 /** Closed outcome of a host approval question; `'allowed-once'` is the only grant. */
 export type HostApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
+/**
+ * TEMPORARY — the subset of one host structured-question request this channel
+ * reads while observing the waterfall. Remove with `Config.probeHostQuestions`.
+ */
+export interface HostUserQuestionRequest {
+  /** The questions to display. */
+  readonly questions: readonly { readonly id: string }[]
+  /** The agent the question is asked on behalf of, when the asker named one. */
+  readonly agent?: { readonly session: { readonly id: string } } | undefined
+  /** Foreground-wait facts; present only for the opt-in timed tool. */
+  readonly wait?: { readonly callId: string; readonly timed?: boolean } | undefined
+}
+
 /** Readonly same-process permission question (subset of `ApprovalRequest`). */
 export interface HostApprovalRequest {
   /** The agent on whose behalf the question is asked; routes the question. */
@@ -816,6 +829,13 @@ declare module '@deepseek-ai/cordis' {
       request: HostApprovalRequest,
       next: () => Promise<HostApprovalOutcome>,
     ): Promise<HostApprovalOutcome>
+    /**
+     * TEMPORARY — the host's structured-question waterfall, declared only so one
+     * observation listener can be registered against it while the question path
+     * is being settled. Remove with `Config.probeHostQuestions`.
+     * @mode waterfall
+     */
+    'user-questions/request'(request: HostUserQuestionRequest, next: () => Promise<never>): Promise<never>
     /**
      * One ordered publication of an agent's live model output. Agent-scoped:
      * a listener receives only the agents whose frames reach its scope, and the

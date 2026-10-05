@@ -1,0 +1,229 @@
+/**
+ * The approval panel this channel's conversations render in the Web composer.
+ *
+ * It presents the same decision the shipped panel does, plus one state that one
+ * cannot reach: a request the log shows was already settled by another surface
+ * — the Feishu chat, in the deployment this was built for. That request's panel
+ * has stopped deciding anything, so this one says so and settles it instead of
+ * waiting for a press that would be discarded.
+ *
+ * The panel is the TEMPORARY half of a two-surface approval; see the plugin
+ * entry for why the durable fix belongs in the gateway.
+ * @module dsh-lark-channel/client/ApprovalPanel
+ */
+
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { HostObservable, InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type { AnswerablePending, PanelFace, PanelTarget } from './panel-store.ts'
+import { asPendingApproval, retirementFor, settledForTarget } from './panel-store.ts'
+import type { SettledApproval } from './decisions.ts'
+import type { UseSessionStatus, SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
+import type { ChatNode, ChatSnapshot, UseChat } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { DisplayReason } from './panel-store.ts'
+import css from './ApprovalPanel.module.css'
+
+/** The framework seats this panel reads. */
+export interface LarkApprovalPanelProps {
+  /** Selector-matched request, from the chain entry's `select`. */
+  readonly matched: PanelTarget
+  /** Live settled-approval reads. */
+  readonly panel: PanelFace
+  /** The Client's pending-interaction status seat. */
+  readonly useSessionStatus: UseSessionStatus
+  /** The Chat store seat, which resolves the correlated Tool call's command. */
+  readonly useChat: UseChat
+  /** Panel copy. */
+  readonly t: PropsLocale<'larkApproval'>['t']
+}
+
+/**
+ * The live reads this registration hands its own component.
+ *
+ * `hooks` is the registrant-private compartment: the renderer binds each bare
+ * observable to a `use<Name>` selector hook, so the component subscribes
+ * through the framework instead of holding a subscription of its own.
+ */
+export interface LarkApprovalInjected {
+  readonly panel: PanelFace
+  /** Resolve the asker's localized reason into the active UI language. */
+  readonly resolveReason: (reason: DisplayReason) => string
+  readonly hooks: {
+    readonly larkSettled: HostObservable<readonly SettledApproval[]>
+  }
+}
+
+/**
+ * Present one approval on a conversation this channel drives.
+ *
+ * The pending request, the settled fold, and the correlated command are all
+ * read through framework seats rather than handed in: `select` must stay a pure
+ * function of the owner props, so every live read reaches the component through
+ * a hook the slot composes onto it.
+ * @param props - matched request, live reads, and the locale seat.
+ * @returns the approval composer takeover.
+ */
+export function ApprovalPanel(props: LarkApprovalPanelProps & InjectFace<LarkApprovalInjected>) {
+  const settled = props.useLarkSettled((all: readonly SettledApproval[]) => all)
+  const pending = props.useSessionStatus((snapshot: SessionStatusSnapshot) =>
+    asPendingApproval(snapshot.get(props.matched.sessionId)?.pendingInteraction))
+  const callId = props.matched.callId
+  // The command comes from the Chat store, the same source the shipped detail
+  // renders from. Replacing that panel replaces its detail too, and a person
+  // approving a shell call has to see what they are approving — an escalation
+  // granted without the command is a press that decides nothing knowable.
+  const command = props.useChat((snapshot: ChatSnapshot) => commandForCall(snapshot, callId))
+  // The asker's own explanation outranks this plugin's generic sentence, on the
+  // same terms the shipped panel uses: it is the only text that says what this
+  // particular request is for.
+  const { displayReason, reason: plainReason } = props.matched
+  const reason = displayReason === undefined ? plainReason : props.resolveReason(displayReason)
+  const settledHere = settledForTarget(settled, props.matched)
+  return (
+    <PanelFlow
+      key={`${callId ?? props.matched.toolName}:${String(settledHere.length > 0)}`}
+      matched={props.matched}
+      panel={props.panel}
+      pending={pending}
+      settled={settledHere}
+      command={command}
+      reason={reason}
+      t={props.t}
+    />
+  )
+}
+
+/** The Command text a correlated Tool call carries, when it carries one. */
+function commandForCall(snapshot: ChatSnapshot, callId: string | undefined): string | undefined {
+  if (callId === undefined) return undefined
+  for (const node of snapshot.nodes.values()) {
+    const root = node.kind === 'tool-call' ? (node as ChatNode<'tool-call'>).data.root : undefined
+    if (root === undefined || 'kind' in root || root.phase !== 'start') continue
+    if (root.callId !== callId) continue
+    return commandOf(root)
+  }
+  return undefined
+}
+
+/**
+ * Extract a shell command from one Tool call's raw arguments.
+ * @param call - the started Tool call block, when a correlated call exists.
+ * @returns command text, or undefined for absent, malformed, or unrelated arguments.
+ */
+function commandOf(call: { readonly argsRaw: string }): string | undefined {
+  try {
+    const args = JSON.parse(call.argsRaw) as Record<string, unknown>
+    return typeof args.command === 'string' ? args.command : undefined
+  } catch {
+    // Arguments that are not JSON carry no command to show; the panel still
+    // presents the decision, only without a quoted command.
+    return undefined
+  }
+}
+
+function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {
+  readonly matched: PanelTarget
+  readonly panel: PanelFace
+  readonly pending: AnswerablePending | undefined
+  readonly settled: readonly SettledApproval[]
+  readonly command: string | undefined
+  readonly reason: string | undefined
+  readonly t: PropsLocale<'larkApproval'>['t']
+}) {
+  const [answered, setAnswered] = useState(false)
+  const waiting = useRef(false)
+  const active = useRef(true)
+  const composing = useRef(false)
+  const compositionEnded = useRef(false)
+  useEffect(() => {
+    active.current = true
+    return () => { active.current = false }
+  }, [])
+
+  const settledElsewhere = settled.length > 0
+
+  /**
+   * Retire the requests the log shows were already decided, so the panel the
+   * chat left behind does not stand waiting for a press that can no longer
+   * change anything.
+   *
+   * Each settled request is recorded against its own log identity, which is
+   * what removes it from the fold. The outcome submitted here is discarded:
+   * the channel's listener already returned the real decision to the Host, so
+   * the forwarded waterfall this browser still holds resolves into a race that
+   * finished long ago. Submitting anything only closes this page's copy without
+   * touching the decision that was actually taken — which is why the value is
+   * arbitrary and only its arrival matters. A request the Client no longer
+   * presents, or one another surface settled in the same tick, needs nothing —
+   * the shipped class rejects a second settlement, which is the expected
+   * outcome here and not a failure.
+   */
+  useEffect(() => {
+    const retire = retirementFor(settled, pending)
+    if (retire.length === 0) return
+    for (const requestId of retire) panel.markAnsweredHere(matched.sessionId, requestId)
+    void pending?.answer('allowed-once').catch(() => {})
+  }, [settled, pending, panel, matched.sessionId])
+
+  const answer = (outcome: 'allowed-once' | 'rejected'): void => {
+    if (waiting.current || pending === undefined || !pending.answerable) return
+    waiting.current = true
+    setAnswered(true)
+    for (const approval of settled) panel.markAnsweredHere(matched.sessionId, approval.id)
+    void pending.answer(outcome).catch(() => {
+      if (!active.current) return
+      waiting.current = false
+      setAnswered(false)
+    })
+  }
+
+  const keydown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    const element = event.target as Element
+    if (event.defaultPrevented || !event.currentTarget.contains(document.activeElement)
+      || element.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]') !== null) return
+    if (event.key !== 'Enter' && event.key !== 'Escape') return
+    if (event.key === 'Enter' && element.closest('button, a[href], [role="button"]') !== null) return
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+    event.preventDefault()
+    event.stopPropagation()
+    // oxlint-disable-next-line typescript/no-deprecated -- IME 229 covers engines without isComposing.
+    if (event.repeat || composing.current || compositionEnded.current || event.nativeEvent.isComposing || event.keyCode === 229) return
+    answer(event.key === 'Enter' ? 'allowed-once' : 'rejected')
+  }
+
+  const inert = answered || settledElsewhere
+  return (
+    <div className={css.root} data-lark-approval-key={matched.callId ?? matched.toolName} aria-busy={inert}
+      onKeyDown={keydown}
+      onKeyUpCapture={() => { compositionEnded.current = false }}
+      onCompositionStartCapture={() => { composing.current = true }}
+      onCompositionEndCapture={() => { composing.current = false; compositionEnded.current = true }}>
+      <div className={css.card}>
+        <div className={css.strip}>
+          <StateDot state={settledElsewhere ? 'done' : answered ? 'ongoing' : 'warning'} />
+          {settledElsewhere ? t('decidedElsewhere') : t('waiting')}
+        </div>
+        <div className={css.body} tabIndex={0} role="group" aria-label={t('detail.aria')}>
+          <div className={css.headline}>
+            {reason ?? t('escalation', { toolName: matched.toolName })}
+          </div>
+          {command !== undefined && <div className={css.command}>{command}</div>}
+        </div>
+        <div className={css.actionRow}>
+          <Button variant="outline" className={css.reject} disabled={inert} onClick={() => { answer('rejected') }}>
+            {t('reject')}
+          </Button>
+          <Button variant="primary" disabled={inert} onClick={() => { answer('allowed-once') }}>
+            {t('allowOnce')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Full props of this panel's registration, for tests and the register site. */
+export type LarkApprovalPanelFullProps =
+  PropsRuntime<'conversation.composer'>
+  & { readonly matched: PanelTarget }
+  & PropsLocale<'larkApproval'>

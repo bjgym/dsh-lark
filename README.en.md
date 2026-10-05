@@ -76,6 +76,19 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
 | Slash commands | Host commands (`/plan`, `/compact`, …) run straight through the DSH command runtime |
 | File transfer | A file sent into the chat becomes something the agent can read from the workspace; sending one back shows a group an approval card first |
+| Web sync | An approval settled on another surface retires itself on the web panel instead of waiting for a press that no longer decides anything |
+
+### The web-side approval panel
+
+One approval appears on two surfaces at once — the Feishu card and the web panel — and the first answer wins. When the chat answers first, this page's copy of the question has already stopped deciding anything, but that panel belongs to the host, and the host settles a forwarded request only when a client replies or the request's lifetime ends. This plugin supplies the missing half: it reads the `approval/asked` / `approval/decided` audit pair out of the session log, recognises that another surface already settled the request, says so on the web panel, and retires it.
+
+**This applies to every conversation, not only the channel's own.** That is the reach of a chain selector rather than a widening of scope: a selector is a pure function of the owner props — the session id, the session snapshot, and the pending request — and can read **no live fact at all**. Whether a particular chat is currently driving a conversation exists only on the host (the binding table, or the channel's own session projection). A session id cannot answer it either: `/sessions` lets a chat continue a session it did not derive, so a conversation this channel drives may carry any id. Claiming narrowly by name missed those, and the request it missed is exactly the one whose shipped panel keeps its buttons after the chat has already decided.
+
+The cost is that this panel replaces the host's. It reproduces the Enter/Escape keys, the submission lock, the asker's reason text, and the correlated tool call's command — but `conversation.approval.detail` is declared by the host and a plugin cannot declare it again, so a third party's contribution to that slot will not render. On a conversation no chat drives, no other surface ever writes a decision, so this panel behaves exactly as the host's does.
+
+The chat side is unchanged: the card is still sent, and the two surfaces still race.
+
+> **This is temporary.** The durable fix belongs in the host: the gateway should cancel delivered browsers when an earlier listener claims the waterfall, or the channel should register inside `forwardWaterfall` and share one settlement with the browser. When that lands, this browser half should be deleted rather than extended.
 
 ## Commands
 
