@@ -4,7 +4,12 @@
  * One source per session id, created on first use and kept for the page's
  * lifetime: a conversation the browser has open may settle a request at any
  * moment, and a source that is torn down between panels would have to replay
- * the window to answer the same question again.
+ * the window to answer the same question again. Keeping it obliges it to
+ * re-follow the conversation's CURRENT generation on every attach: a Client
+ * Session scope is retired and re-materialized when its retain count reaches
+ * zero — leaving a conversation and returning builds a new Session, and with it
+ * a new event source — so a fold still following the retired one would freeze at
+ * its last value and silently stop reporting decisions.
  *
  * The skeleton — borrow the binding, follow its window, recompute, publish only
  * on change, remember what this page settled itself — is the same for every
@@ -169,41 +174,62 @@ class SessionSettled<T> implements SettledSource<T> {
   markAnsweredHere(requestId: string): void {
     if (this.answeredHere.has(requestId)) return
     this.answeredHere.add(requestId)
-    this.republish()
+    // A press can land right after the conversation was replaced, so the
+    // generation is re-resolved before folding: the new window is the one that
+    // answers, not the retired one this source may still have been following.
+    this.attach()
+    this.republish(this.binding?.eventSource.getSnapshot())
   }
 
-  /** Detach from the window. */
+  /** Detach from the conversation's window. */
   dispose(): void {
     this.released = true
-    this.unsubscribe?.()
-    this.unsubscribe = undefined
+    this.detach()
     this.listeners.clear()
   }
 
   /**
-   * Borrow the live binding and follow its window once. A binding that is not
-   * materialized yet leaves the fold empty; the next subscriber retries, which
-   * is exactly when a panel exists and the conversation is therefore held.
+   * Follow the conversation's current generation.
+   *
+   * The binding is re-resolved on every attach rather than captured on the
+   * first one: a Client Session scope is retired and re-materialized when its
+   * retain count reaches zero — leaving a conversation and returning builds a
+   * new Session, and with it a new event source — and a fold that kept
+   * following the retired one would freeze at its last value, silently ceasing
+   * to report decisions. Re-following is safe because the fold re-scans the
+   * whole window instead of consuming deltas, so nothing depends on having seen
+   * every intermediate publication. A binding that is not materialized yet
+   * leaves the fold empty; the next attach retries, which is exactly when a
+   * panel exists and the conversation is therefore held.
    */
   private attach(): void {
-    if (this.unsubscribe !== undefined || this.released) return
+    if (this.released) return
     const binding = this.sessions.binding(this.sessionId)
-    if (binding === undefined) return
+    if (binding === this.binding) return
+    this.detach()
     this.binding = binding
-    const source = binding.eventSource
+    const source = binding?.eventSource
+    if (source === undefined) {
+      this.republish(undefined)
+      return
+    }
     this.republish(source.getSnapshot())
     this.unsubscribe = source.subscribe(() => { this.republish(source.getSnapshot()) })
   }
 
+  /** Stop following the borrowed window, keeping the fold's own state. */
+  private detach(): void {
+    this.unsubscribe?.()
+    this.unsubscribe = undefined
+  }
+
   /**
    * Recompute the fold and publish only when it moved.
-   * @param window - current window, or the borrowed binding's when omitted.
+   * @param window - the followed window, or undefined while no generation is followed.
    */
-  private republish(window?: SessionEventWindow): void {
+  private republish(window: SessionEventWindow | undefined): void {
     if (this.released) return
-    const current = window ?? this.binding?.eventSource.getSnapshot()
-    if (current === undefined) return
-    const next = this.how.read(current, this.answeredHere)
+    const next = window === undefined ? [] : this.how.read(window, this.answeredHere)
     if (sameSet(this.read, next, this.how.identityOf)) return
     this.read = next
     for (const listener of [...this.listeners]) listener()

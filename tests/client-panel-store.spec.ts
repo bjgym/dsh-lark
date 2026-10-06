@@ -56,26 +56,26 @@ const settledBash = (id: string, callId?: string) => [
 describe('settledForTarget', () => {
   it('answers a panel by the exact tool call', () => {
     const settled = [{ id: 'a', toolName: 'bash', callId: 'call_1' }]
-    expect(settledForTarget(settled, { sessionId: SESSION, toolName: 'bash', callId: 'call_1' }))
+    expect(settledForTarget(settled, { sessionId: SESSION, key: 'approval:1', toolName: 'bash', callId: 'call_1' }))
       .toEqual([{ id: 'a', toolName: 'bash', callId: 'call_1' }])
   })
 
   it('does not answer a panel about a different tool call', () => {
     const settled = [{ id: 'a', toolName: 'bash', callId: 'call_1' }]
-    expect(settledForTarget(settled, { sessionId: SESSION, toolName: 'bash', callId: 'call_2' })).toEqual([])
+    expect(settledForTarget(settled, { sessionId: SESSION, key: 'approval:1', toolName: 'bash', callId: 'call_2' })).toEqual([])
   })
 
   it('falls back to the tool name when the asker named no call', () => {
-    expect(settledForTarget([{ id: 'a', toolName: 'bash' }], { sessionId: SESSION, toolName: 'bash' }))
+    expect(settledForTarget([{ id: 'a', toolName: 'bash' }], { sessionId: SESSION, key: 'approval:1', toolName: 'bash' }))
       .toEqual([{ id: 'a', toolName: 'bash' }])
   })
 
   it('does not answer a panel about a different tool', () => {
-    expect(settledForTarget([{ id: 'a', toolName: 'bash' }], { sessionId: SESSION, toolName: 'read' })).toEqual([])
+    expect(settledForTarget([{ id: 'a', toolName: 'bash' }], { sessionId: SESSION, key: 'approval:1', toolName: 'read' })).toEqual([])
   })
 
   it('answers nothing while the request is still open', () => {
-    expect(settledForTarget([], { sessionId: SESSION, toolName: 'bash' })).toEqual([])
+    expect(settledForTarget([], { sessionId: SESSION, key: 'approval:1', toolName: 'bash' })).toEqual([])
   })
 })
 

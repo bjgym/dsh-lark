@@ -83,6 +83,71 @@ describe('SettledApprovalsRegistry', () => {
     dispose()
   })
 
+  it('follows a replaced conversation generation', () => {
+    const retired = windowSource([
+      entry({ type: 'approval/asked', data: { id: 'a', toolName: 'bash' } }),
+    ])
+    const replacement = windowSource([
+      entry({ type: 'approval/asked', data: { id: 'b', toolName: 'pwsh' } }),
+      entry({ type: 'approval/decided', data: { id: 'b', outcome: 'allowed-once' } }),
+    ])
+    let live: SessionBinding | undefined = bindingOver(retired)
+    const registry = new SettledApprovalsRegistry(sessionsFace(() => live))
+    const read = registry.sourceFor(SESSION)
+    read.subscribe(() => {})
+    expect(retired.subscriberCount).toBe(1)
+
+    // Leaving the conversation retires its Client Session; returning builds a
+    // new one, and with it a new window the fold has never seen.
+    live = bindingOver(replacement)
+    read.subscribe(() => {})
+
+    expect(retired.subscriberCount).toBe(0)
+    expect(replacement.subscriberCount).toBe(1)
+    expect(read.getSnapshot()).toEqual([{ id: 'b', toolName: 'pwsh' }])
+  })
+
+  it('clears a stale fold when the replacement reports nothing', () => {
+    const retired = windowSource([
+      entry({ type: 'approval/asked', data: { id: 'a', toolName: 'bash' } }),
+      entry({ type: 'approval/decided', data: { id: 'a', outcome: 'allowed-once' } }),
+    ])
+    const replacement = windowSource()
+    let live: SessionBinding | undefined = bindingOver(retired)
+    const registry = new SettledApprovalsRegistry(sessionsFace(() => live))
+    const read = registry.sourceFor(SESSION)
+    read.subscribe(() => {})
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+
+    live = bindingOver(replacement)
+    const seen = vi.fn()
+    read.subscribe(seen)
+
+    expect(read.getSnapshot()).toEqual([])
+    expect(seen).toHaveBeenCalled()
+  })
+
+  it('re-resolves the generation when this browser answers', () => {
+    const retired = windowSource([
+      entry({ type: 'approval/asked', data: { id: 'a', toolName: 'bash' } }),
+      entry({ type: 'approval/decided', data: { id: 'a', outcome: 'allowed-once' } }),
+    ])
+    const replacement = windowSource([
+      entry({ type: 'approval/asked', data: { id: 'b', toolName: 'pwsh' } }),
+      entry({ type: 'approval/decided', data: { id: 'b', outcome: 'allowed-once' } }),
+    ])
+    let live: SessionBinding | undefined = bindingOver(retired)
+    const registry = new SettledApprovalsRegistry(sessionsFace(() => live))
+    const read = registry.sourceFor(SESSION)
+    read.subscribe(() => {})
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+
+    live = bindingOver(replacement)
+    read.markAnsweredHere('b')
+
+    expect(read.getSnapshot()).toEqual([])
+  })
+
   it('publishes a decision that arrives while subscribed', () => {
     const source = windowSource([entry({ type: 'approval/asked', data: { id: 'a', toolName: 'bash' } })])
     const registry = new SettledApprovalsRegistry(sessionsFace(() => bindingOver(source)))

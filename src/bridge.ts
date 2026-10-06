@@ -1900,12 +1900,7 @@ export function installBridge(
             release,
           })
         } else if (channelCommand === SESSIONS_COMMAND) {
-          // TEMPORARY PROBE — remove with the others. Times the whole command,
-          // which is what its own callback deadline covers.
-          const listingAt = Date.now()
-          const painted = await sessionPicker(subject, msg.content)
-          diag('warn', `PROBE /sessions key=${key} took=${Date.now() - listingAt}ms`)
-          reply = { card: painted }
+          reply = { card: await sessionPicker(subject, msg.content) }
         } else {
           reply = { card: renderStatusCard({ ...statusFieldsFor(subject), ...presetOf(subject) }, subject) }
         }
@@ -2656,9 +2651,6 @@ export function installBridge(
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
     const before = conversationStamp(value.key)
-    // TEMPORARY PROBE — remove with the one in `cachedOfferedSessions`. Times one
-    // whole press, which is what the platform actually gives a deadline.
-    const pressedAt = Date.now()
     // ONE derivation per press, shared by the authorization check and the
     // repaint. Deriving twice was the original shape and it is what timed the
     // platform's callback out: the list is read from every candidate's whole
@@ -2667,7 +2659,6 @@ export function installBridge(
     // at all is equally wrong: the rows a press may name are exactly the rows
     // this list draws, and the paint has to come from the same answer.
     const offered = await cachedOfferedSessions(value.key)
-    diag('warn', `PROBE press key=${value.key} session=${value.session} derive=${Date.now() - pressedAt}ms`)
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
       notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
@@ -2906,28 +2897,9 @@ export function installBridge(
    * @returns the rows to offer and the hidden count.
    */
   const cachedOfferedSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
-    // TEMPORARY PROBE — remove once the callback budget is settled. It exists to
-    // tell a cache HIT apart from a cold derivation in the diagnostic log, which
-    // the derivation's own report cannot: that report is only written when a
-    // derivation runs, so a press that reused one is invisible.
-    const why = (): string => {
-      if (keyword !== '') return `keyword="${keyword}"`
-      const entry = lastOffered.get(key)
-      if (entry === undefined) return 'no entry'
-      if (entry.stamp !== conversationStamp(key)) return 'stamp changed'
-      const age = Date.now() - entry.at
-      return age >= OFFERED_TTL_MS ? `expired after ${age}ms` : `fresh ${age}ms`
-    }
-    const reason = why()
-    const started = Date.now()
-    if (keyword !== '') {
-      const offered = await offeredSessions(key, keyword)
-      diag('warn', `PROBE derive keyword key=${key} took=${Date.now() - started}ms why=${reason}`)
-      return offered
-    }
+    if (keyword !== '') return await offeredSessions(key, keyword)
     const entry = lastOffered.get(key)
     if (entry !== undefined && entry.stamp === conversationStamp(key) && Date.now() - entry.at < OFFERED_TTL_MS) {
-      diag('warn', `PROBE HIT key=${key} took=${Date.now() - started}ms why=${reason} rows=${entry.offered.rows.length}`)
       return entry.offered
     }
     const offered = await offeredSessions(key, keyword)
@@ -2935,7 +2907,6 @@ export function installBridge(
     // not be recorded as this list's basis, or the next press would reuse rows
     // from the directory the conversation has left.
     lastOffered.set(key, { stamp: conversationStamp(key), at: Date.now(), offered })
-    diag('warn', `PROBE MISS key=${key} took=${Date.now() - started}ms why=${reason} rows=${offered.rows.length}`)
     return offered
   }
 

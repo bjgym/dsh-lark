@@ -645,7 +645,8 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
       ...facts.lastActive === undefined ? {} : { lastActive: facts.lastActive },
       turns: facts.turns,
     }
-  }))  // A session nothing ever happened in is not a conversation to continue —
+  }))
+  // A session nothing ever happened in is not a conversation to continue —
   // except this one's own, which is how a picked conversation comes back. Where
   // the host lends no event listing, nothing ever happened in ANY of them as
   // far as this can tell, and dropping the lot would leave a picker that only

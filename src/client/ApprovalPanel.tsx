@@ -19,7 +19,8 @@ import type { AnswerablePending, PanelFace, PanelTarget } from './panel-store.ts
 import { asPendingApproval, retirementFor, settledForTarget } from './panel-store.ts'
 import type { SettledApproval } from './decisions.ts'
 import type { UseSessionStatus, SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
-import type { ChatNode, ChatSnapshot, UseChat } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { ChatSnapshot, UseChat } from '@deepseek-ai/dsh-client-ui-chat/client'
+import { commandForCall } from './approval-command.ts'
 import type { DisplayReason } from './panel-store.ts'
 import css from './ApprovalPanel.module.css'
 
@@ -68,13 +69,10 @@ export function ApprovalPanel(props: LarkApprovalPanelProps & InjectFace<LarkApp
   const pending = props.useSessionStatus((snapshot: SessionStatusSnapshot) =>
     asPendingApproval(snapshot.get(props.matched.sessionId)?.pendingInteraction))
   const callId = props.matched.callId
-// The command comes from the Chat store, the same source the shipped detail
-// renders from — the shipped `conversation.approval.detail` renderer is a
-// command extractor over this same snapshot, matched by call id on any phase
-// (a completed call still carries the command it was approved for), which is
-// why the narrowing below does not filter by phase. A person approving a
-// shell call has to see what they are approving — an escalation granted
-// without the command is a press that decides nothing knowable.
+  // The command comes from the Chat store, the same source the shipped detail
+  // renders from. A person approving a shell call has to see what they are
+  // approving — an escalation granted without the command is a press that
+  // decides nothing knowable.
   const command = props.useChat((snapshot: ChatSnapshot) => commandForCall(snapshot, callId))
   // The asker's own explanation outranks this plugin's generic sentence, on the
   // same terms the shipped panel uses: it is the only text that says what this
@@ -94,38 +92,6 @@ export function ApprovalPanel(props: LarkApprovalPanelProps & InjectFace<LarkApp
       t={props.t}
     />
   )
-}
-
-/** The Command text a correlated Tool call carries, when it carries one. */
-function commandForCall(snapshot: ChatSnapshot, callId: string | undefined): string | undefined {
-  if (callId === undefined) return undefined
-  for (const node of snapshot.nodes.values()) {
-    const root = node.kind === 'tool-call' ? (node as ChatNode<'tool-call'>).data.root : undefined
-    if (root === undefined || 'kind' in root) continue
-    if (root.callId !== callId) continue
-    return commandOf(root)
-  }
-  return undefined
-}
-
-/**
- * Extract a shell command from one Tool call's raw arguments.
- * @param call - the Tool call block, in whatever phase it currently reads.
- * @returns command text, or undefined for absent, malformed, or unrelated arguments.
- */
-function commandOf(call: unknown): string | undefined {
-  const argsRaw = typeof call === 'object' && call !== null
-    ? (call as { readonly argsRaw?: unknown }).argsRaw
-    : undefined
-  if (typeof argsRaw !== 'string') return undefined
-  try {
-    const args = JSON.parse(argsRaw) as Record<string, unknown>
-    return typeof args.command === 'string' ? args.command : undefined
-  } catch {
-    // Arguments that are not JSON carry no command to show; the panel still
-    // presents the decision, only without a quoted command.
-    return undefined
-  }
 }
 
 function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {

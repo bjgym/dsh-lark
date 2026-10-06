@@ -130,7 +130,8 @@ export type SwitchResult =
   | { readonly ok: false; readonly reason: string }
 
 /** Construction options for {@link ChatWorkspaces}. */
-export interface ChatWorkspacesOptions {  /** The deployment default directory (resolved, not necessarily canonical). */
+export interface ChatWorkspacesOptions {
+  /** The deployment default directory (resolved, not necessarily canonical). */
   readonly defaultPath: string
   /** Persisted conversation-key → directory entries; {@link DEFAULT_MARKER} means default. */
   readonly entries?: Record<string, string> | undefined
