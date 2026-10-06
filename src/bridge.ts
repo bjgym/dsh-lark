@@ -1316,6 +1316,19 @@ export function installBridge(
       // cwd it validates against rather than an uncanonicalized variant of it.
       const directory = pathBySession.get(sessionId) ?? defaultCwd
       const workspace = await workspaceRecordFor(directory)
+      // A derived id is reachable again only here, so an archived one has to be
+      // restored before the agent is made: the host's archived-session gate
+      // rejects every step of an archived session, and the person's next message
+      // would otherwise be answered by nothing at all. Only this channel's own
+      // derivations reach this rung — a pick that fails to resume is refused
+      // above — so nothing another surface archived on purpose is reopened.
+      if (archivedSessions().has(sessionId)) {
+        const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
+        await registry?.unarchiveSession?.(sessionId).catch((error: unknown) => {
+          notify(`lark-channel: session ${sessionId} stays archived: ${String(error)}`)
+        })
+        diag('info', `lark-channel: restored the archived session ${sessionId} to start it`)
+      }
       const handle = await agents.create({
         sessionId,
         meta: {
@@ -1443,7 +1456,7 @@ export function installBridge(
       ...hosted.map(descriptor => ({ name: descriptor.name, description: descriptor.description })),
       { name: STOP_COMMAND, description: '停止当前任务' },
       { name: CD_COMMAND, description: '切换本会话的工作区目录' },
-      { name: WS_COMMAND, description: '查看可用工作区' },
+      { name: WS_COMMAND, description: '选择工作区，点一行即切换' },
       { name: GET_COMMAND, description: '把工作区里的文件发到聊天' },
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },

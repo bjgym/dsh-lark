@@ -66,7 +66,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 |---|---|
 | Durable sessions | Survive a restart; the next message continues where you were, and `/new` starts over in place |
 | Continue a session | `/sessions` lists what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; `/cd` and `/new` return it to the derived session |
-| Workspaces | `/ws` lists, `/cd` switches; returning to one resumes the work you left there |
+| Workspaces | `/ws` opens a workspace picker where one press switches; `/cd` switches directly by name or path; returning to one resumes the work you left there |
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
 | Cards that ask | Single or multiple choice, or type an answer; approve a plan or send feedback; allow or refuse a tool call |
@@ -76,7 +76,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
 | Slash commands | Host commands (`/plan`, `/compact`, …) run straight through the DSH command runtime |
 | File transfer | A file sent into the chat becomes something the agent can read from the workspace; sending one back shows a group an approval card first |
-| Web sync | An approval settled on another surface retires itself on the web panel instead of waiting for a press that no longer decides anything |
+| Web sync | An approval or question settled on another surface retires itself on the web panel instead of waiting for a press that no longer decides anything |
 
 ### The web-side approval panel
 
@@ -84,18 +84,33 @@ One approval appears on two surfaces at once — the Feishu card and the web pan
 
 **This applies to every conversation, not only the channel's own.** That is the reach of a chain selector rather than a widening of scope: a selector is a pure function of the owner props — the session id, the session snapshot, and the pending request — and can read **no live fact at all**. Whether a particular chat is currently driving a conversation exists only on the host (the binding table, or the channel's own session projection). A session id cannot answer it either: `/sessions` lets a chat continue a session it did not derive, so a conversation this channel drives may carry any id. Claiming narrowly by name missed those, and the request it missed is exactly the one whose shipped panel keeps its buttons after the chat has already decided.
 
-The cost is that this panel replaces the host's. It reproduces the Enter/Escape keys, the submission lock, the asker's reason text, and the correlated tool call's command — but `conversation.approval.detail` is declared by the host and a plugin cannot declare it again, so a third party's contribution to that slot will not render. On a conversation no chat drives, no other surface ever writes a decision, so this panel behaves exactly as the host's does.
+The cost is that this panel replaces the host's. It reproduces the Enter/Escape keys, the submission lock, the asker's reason text, and the correlated tool call's command — but `conversation.approval.detail` is declared by the host and a plugin cannot declare it again, so a third party's contribution to that slot will not render. On a conversation no chat drives, no other surface ever writes a decision, so this panel behaves as the host's does — apart from that slot, and apart from how the correlated command is read: the host shows it only while the tool call is in its start phase, while this panel still shows it once the call has completed.
 
-The chat side is unchanged: the card is still sent, and the two surfaces still race.
+The card is still sent and the two surfaces still race; when the web answers first, the settled card in the chat says where the decision came from ("decided in the web app") instead of reading as a press made here.
 
 > **This is temporary.** The durable fix belongs in the host: the gateway should cancel delivered browsers when an earlier listener claims the waterfall, or the channel should register inside `forwardWaterfall` and share one settlement with the browser. When that lands, this browser half should be deleted rather than extended.
+
+### The web-side question panel
+
+A question (`ask_user_question`) likewise appears on both surfaces at once, and the first answer wins: the web copy reads the session log, recognises that another surface already answered, says so, and retires itself — and the closing card displays the log's own record rather than this browser's unfinished drafts, its status strip trading the waiting tone for a completion one. The recognition shares its skeleton with the approval panel — both read through the same settled-source registry — but the keys differ: an approval correlates by tool call (falling back to the tool name when the asker named no call), while a question recognises only the newest `ask_user_question` call, and only when that call left a successful result. Beyond that it reproduces the host's question wizard item by item, so replacing it loses nothing:
+
+- One question per page with a pager, previous/next, and collapsing the whole card;
+- Skipping a question, answer validation, and the submission lock;
+- **The countdown and "take time"**: the page can stop its own countdown, after which the host waits like a blocking question; editing a draft, focusing the answer surface, or leaving the window or the tab moves the countdown with the person (frozen or resumed). The deadline itself always belongs to the host — the panel only displays it;
+- **Drafts survive a remount**, including the "take time" decision; once the request is gone they are pruned, so they cannot become the next request's answer;
+- **A read-only review card**: a settled call reopens from its tool call row showing the recorded answers, with nothing to submit;
+- **Closing means what it means on the host**: a request keyed by a tool call only withdraws the panel, which the tool call row reopens; a request the host never named ends the whole batch.
+
+The panel root and its scroll area carry the host's own attributes (`data-question-key` / `data-question-scroll`), so client code and e2e selectors that depend on them keep working.
+
+The card is still sent and the two surfaces still race; when the web answers first, the settled card in the chat says "answered in the web app", and the rest of that batch stops opening cards.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `/status` | Show and refresh workspace, model, and session; context and tokens where available |
-| `/ws` | List the workspaces this channel can reach |
+| `/ws` | Open the workspace picker; one press switches |
 | `/cd <name or path>` | Switch this conversation's workspace |
 | `/get <path>` | Send a workspace file to the chat |
 | `/model` | Open the model picker |
@@ -103,7 +118,7 @@ The chat side is unchanged: the card is still sent, and the two surfaces still r
 | `/model reset` | Back to the deployment default |
 | `/permission` | Open the permission-preset picker |
 | `/permission <preset>` | Switch preset without opening a card |
-| `/new` | Start a fresh session in place; workspace and model stay |
+| `/new` | Start a fresh session in place; workspace and model stay, and a session archived earlier is restored before it starts |
 | `/sessions` | List the sessions this conversation may continue, one press each |
 | `/sessions <keyword>` | Filter that list by title or id |
 | `/stop` | Stop the running task |
@@ -175,6 +190,7 @@ dsh web
 - Settled approval cards record who decided: when the callback omits a name, the channel best-effort resolves it from the current chat roster. Missing roster permission, lookup failures, or departed members safely show the open id instead and never block approval or file delivery.
 - The single-file ceiling defaults to 20 MiB, set separately for each direction with `maxReceiveFileBytes` and `maxSendFileBytes`; documents (pdf / xlsx / docx) only ever arrive as a download with no online preview, because the upstream SDK uploads every general file as the `stream` type instead of inferring one from the extension.
 - Voice messages land on disk like any other file; nothing transcribes them.
+- Diagnostics reach the process terminal by default; name `diagnosticsFile` and this channel appends them to that file instead (a path with an extension is the file, anything else is a directory that holds `dsh-lark-diagnostics.log`), with `diagnosticsLevel` as the floor (default `warn`; `debug`/`info`/`warn`/`error`). `diagnoseSessions` is off by default and, when on, reports which candidate `/sessions` admitted or withheld, under which rule, plus the counts at each stage — the line count scales with the withheld records, which is what makes a short list attributable.
 - Configuration is read at startup; changing it needs a restart.
 
 </details>
@@ -182,7 +198,7 @@ dsh web
 ## Requirements
 
 - Node.js `^22.19.0 || >=24`
-- DeepSeek Harness `0.1.0-rc.6` or newer
+- DeepSeek Harness `0.2.0-rc.1` or newer (the web-side approval and question panels need it; this repository is built and tested against `0.2.0-rc.2`)
 - A Feishu or Lark tenant
 
 A native thinking process needs Feishu PC 7.70 / mobile 7.74 or newer; older clients can use `output: 'stream'`.

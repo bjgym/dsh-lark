@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { answerBatchOf, retirementForQuestion } from '../src/client/question-store.ts'
+import {
+  answerBatchOf, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion,
+} from '../src/client/question-store.ts'
 import type { AnswerableQuestion, QuestionSpec } from '../src/client/question-store.ts'
+import { createQuestionDrafts } from '../src/client/question-drafts.ts'
 import { foldSettledQuestions } from '../src/client/question-decisions.ts'
 import type { SessionEventWindow } from '@deepseek-ai/dsh-api-session-controller/client'
 
@@ -10,13 +13,14 @@ const asked: readonly QuestionSpec[] = [
   { id: 'q2', question: '要不要通知？', options: [{ label: '通知' }, { label: '不通知' }] },
 ]
 
+const unanswered = { selected: [] as string[], custom: '', skipped: false }
+
 describe('the batch one submission sends', () => {
-  it('carries the option a press just settled on, not the state before it', () => {
-    // The regression this exists for: a single-choice press used to build its
-    // answer from React state, which is not readable in the tick it is written,
-    // so every press sent `selected: []` and the model was told the user chose
-    // nothing.
-    const batch = answerBatchOf(asked, [[], []], ['', ''], { index: 0, label: '部署' })
+  it('carries one selected label per single-select question', () => {
+    const batch = answerBatchOf(asked, [
+      { selected: ['部署'], custom: '', skipped: false },
+      unanswered,
+    ])
 
     expect(batch.answers).toEqual([
       { id: 'q1', selected: ['部署'] },
@@ -24,38 +28,60 @@ describe('the batch one submission sends', () => {
     ])
   })
 
-  it('leaves the other questions of the batch alone', () => {
-    const batch = answerBatchOf(asked, [[], ['通知']], ['', ''], { index: 0, label: '取消' })
-
-    expect(batch.answers).toEqual([
-      { id: 'q1', selected: ['取消'] },
-      { id: 'q2', selected: ['通知'] },
-    ])
-  })
-
   it('carries every label of a multiple choice', () => {
-    const batch = answerBatchOf(asked, [['部署', '取消'], []], ['', ''])
+    const batch = answerBatchOf(asked, [
+      { selected: ['部署', '取消'], custom: '', skipped: false },
+      unanswered,
+    ])
 
     expect(batch.answers[0]).toEqual({ id: 'q1', selected: ['部署', '取消'] })
   })
 
   it('carries typed text as the free-form answer, trimmed', () => {
-    const batch = answerBatchOf(asked, [[], []], ['  等周五再上  ', ''])
+    const batch = answerBatchOf(asked, [
+      { selected: [], custom: '  等周五再上  ', skipped: false },
+      unanswered,
+    ])
 
     expect(batch.answers[0]).toEqual({ id: 'q1', selected: [], custom: '等周五再上' })
   })
 
-  it('sends an option and typed text together, which is how "other, plus a label" reads', () => {
-    const batch = answerBatchOf(asked, [['部署'], []], ['但要灰度', ''])
+  it('lets a single-select typed answer replace its selection', () => {
+    // On the shipped composer's terms a typed answer means "no option fits",
+    // so the selection travels empty — an option plus typed text together is
+    // one answer only on a multi-select.
+    const batch = answerBatchOf(asked, [
+      { selected: ['部署'], custom: '但要灰度', skipped: false },
+      unanswered,
+    ])
 
-    expect(batch.answers[0]).toEqual({ id: 'q1', selected: ['部署'], custom: '但要灰度' })
+    expect(batch.answers[0]).toEqual({ id: 'q1', selected: [], custom: '但要灰度' })
+  })
+
+  it('sends an option and typed text together on a multi-select', () => {
+    const multi: readonly QuestionSpec[] = [
+      { id: 'q1', question: '哪些环境？', multiSelect: true, options: [{ label: '预发' }, { label: '生产' }] },
+    ]
+    const batch = answerBatchOf(multi, [
+      { selected: ['预发'], custom: '再加一个灰度环境', skipped: false },
+    ])
+
+    expect(batch.answers[0]).toEqual({ id: 'q1', selected: ['预发'], custom: '再加一个灰度环境' })
+  })
+
+  it('answers a skipped question with an empty selection', () => {
+    const batch = answerBatchOf(asked, [
+      { selected: ['部署'], custom: '', skipped: true },
+      unanswered,
+    ])
+
+    expect(batch.answers[0]).toEqual({ id: 'q1', selected: [] })
   })
 
   it('reports an empty selection only when the user really chose nothing', () => {
-    // Submitting with nothing picked is a real answer — the Host reads it as the
-    // user skipping the question — so this must stay distinguishable from a
-    // press that lost its own label.
-    const batch = answerBatchOf(asked, [[], []], ['', ''])
+    // Submitting with nothing picked is a real answer — the Host reads it as
+    // the user skipping the question.
+    const batch = answerBatchOf(asked, [unanswered, unanswered])
 
     expect(batch.answers).toEqual([
       { id: 'q1', selected: [] },
@@ -63,12 +89,101 @@ describe('the batch one submission sends', () => {
     ])
   })
 
-  it('answers a question the state has no entry for', () => {
-    // State is seeded per question, but a request whose list grew must not throw
-    // or silently drop the question: an unanswered id is still an answer.
-    const batch = answerBatchOf(asked, [], [])
+  it('answers a question the drafts have no entry for', () => {
+    // Drafts are seeded per question, but a request whose list grew must not
+    // throw or silently drop the question: an unanswered id is still an answer.
+    const batch = answerBatchOf(asked, [])
 
     expect(batch.answers.map(answer => answer.id)).toEqual(['q1', 'q2'])
+  })
+})
+
+describe('the recommendation suffix on an option label', () => {
+  it('splits the suffix for display without changing the answer value', () => {
+    expect(parseRecommendedLabel('直接合并 (recommended)')).toEqual({ label: '直接合并', recommended: true })
+    expect(parseRecommendedLabel('先跑测试（推荐）')).toEqual({ label: '先跑测试', recommended: true })
+    expect(parseRecommendedLabel('再想想')).toEqual({ label: '再想想', recommended: false })
+  })
+
+  it('seeds the draft only from a marked first choice', () => {
+    // The marked choice is an implicit draft, not an answer: the panel still
+    // waits for the user's own submission.
+    expect(recommendedFirstOption({ id: 'q1', question: '?', options: [{ label: '先跑测试（推荐）' }, { label: '直接合并' }] }))
+      .toBe('先跑测试（推荐）')
+    expect(recommendedFirstOption({ id: 'q1', question: '?', options: [{ label: '直接合并' }, { label: '先跑测试（推荐）' }] }))
+      .toBeUndefined()
+    expect(recommendedFirstOption({ id: 'q1', question: '?', options: [] })).toBeUndefined()
+    expect(recommendedFirstOption({ id: 'q1', question: '?' })).toBeUndefined()
+  })
+})
+
+describe('the draft registry a remount restores from', () => {
+  const progress = {
+    index: 1,
+    drafts: [
+      { selected: ['部署'], custom: '', skipped: false },
+      { selected: [], custom: '周五再说', skipped: false },
+    ],
+  }
+
+  it('restores a stored progress that matches the request', () => {
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', progress)
+
+    expect(drafts.read('question:1', 2)).toEqual(progress)
+  })
+
+  it('returns a copy, so component state never aliases the registry', () => {
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', progress)
+    const read = drafts.read('question:1', 2)!
+    read.drafts[0]!.selected.push('篡改')
+
+    expect(drafts.read('question:1', 2)!.drafts[0]!.selected).toEqual(['部署'])
+  })
+
+  it('restores nothing when the question count no longer matches', () => {
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', progress)
+
+    expect(drafts.read('question:1', 3)).toBeUndefined()
+  })
+
+  it('clamps a stored index the asker shrank past', () => {
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', { index: 5, drafts: progress.drafts })
+
+    expect(drafts.read('question:1', 2)!.index).toBe(1)
+  })
+
+  it('drops a cleared or disposed request', () => {
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', progress)
+    drafts.clear('question:1')
+    expect(drafts.read('question:1', 2)).toBeUndefined()
+
+    drafts.replace('question:2', progress)
+    drafts.dispose()
+    expect(drafts.read('question:2', 2)).toBeUndefined()
+  })
+
+  it('restores the user\'s wait decision with the draft', () => {
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', { ...progress, wait: 'waiting' })
+
+    expect(drafts.read('question:1', 2)?.wait).toBe('waiting')
+  })
+
+  it('prunes every request a Session no longer presents', () => {
+    // The live keys come from the request object, which is the only party that
+    // knows which sibling cards its Session still holds.
+    const drafts = createQuestionDrafts()
+    drafts.replace('question:1', progress)
+    drafts.replace('question:2', progress)
+    drafts.prune(['question:2'])
+
+    expect(drafts.read('question:1', 2)).toBeUndefined()
+    expect(drafts.read('question:2', 2)).toEqual(progress)
   })
 })
 
@@ -82,6 +197,12 @@ describe('what a panel retires when the log shows another surface answered', () 
   it('retires nothing without a settled call, or without a presented request', () => {
     expect(retirementForQuestion([], pending)).toEqual([])
     expect(retirementForQuestion([{ callId: 'call-1', answers: [] }], undefined)).toEqual([])
+  })
+
+  it('retires nothing for a review card, whose own record is the settlement', () => {
+    const review = { answer: async () => {}, review: [] } satisfies AnswerableQuestion
+
+    expect(retirementForQuestion([{ callId: 'call-1', answers: [] }], review)).toEqual([])
   })
 })
 

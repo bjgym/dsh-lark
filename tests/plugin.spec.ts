@@ -3801,6 +3801,69 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('runs /new for a conversation that runs in an overridden workspace', async () => {
+      // The deployment in the field runs the chat in a directory that is not
+      // the process default, so its derived id carries a workspace digest and
+      // the epoch is keyed by that longer base id. The digest must survive the
+      // epoch fold: dropping it would move the conversation to the default
+      // directory's session instead of starting it over where it is.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-new-')))
+      const store = createFakeSettings()
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { settings: store.settings, workspaces: createFakeWorkspaces().service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const base = harness.agents.created[0]!.sessionId
+      expect(base.startsWith('lark-oc_chat_1--')).toBe(true)
+      expect(base).not.toBe('lark-oc_chat_1')
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      expect(harness.agents.created).toHaveLength(1)
+      expect(store.updates).toContainEqual({ chatEpochs: { [base]: '1' } })
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      expect(harness.agents.created[1]!.sessionId).toBe(`${base}--e1`)
+      await harness.dispose()
+    })
+
+    it('restores an archived session before starting it', async () => {
+      // The reported field case: the conversation's own session was archived in
+      // the host, and the person then typed `/new` to start over. The epoch
+      // moves the derivation, but the host's archived-session gate rejects every
+      // step of an archived id — so the next message would be answered by
+      // nothing. The rung that creates the session is the only place the id is
+      // reachable again, so it lifts the archive there.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-')))
+      const store = createFakeSettings()
+      const first = createFakeWorkspaces()
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { settings: store.settings, workspaces: first.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const base = harness.agents.created[0]!.sessionId
+
+      // Archived from now on, which is what the host reports per derivation.
+      first.service.archivedSessionIds = [base, `${base}--e1`]
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      const started = harness.agents.created[1]!.sessionId
+      expect(started).toBe(`${base}--e1`)
+      // The archive was lifted for the id that is about to run, so the host's
+      // gate lets its first step through.
+      expect(first.unarchived).toContain(started)
+      expect(first.service.archivedSessionIds).not.toContain(started)
+      await harness.dispose()
+    })
+
     it('reports status without creating a session, and tracks turn activity', async () => {
       const harness = await mountChannel()
       await harness.fake.emitMessage(fakeMessage({ content: '/status' }))

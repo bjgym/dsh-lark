@@ -35,6 +35,14 @@ export type DisplayReason = NonNullable<ApprovalPresentationRequest['displayReas
 export interface PanelTarget {
   /** Conversation the request belongs to. */
   readonly sessionId: SessionId
+  /**
+   * The request's own render identity.
+   *
+   * Carried because the shipped panel publishes it as the panel's DOM key, and
+   * other Client code — the conversation's Escape routing among it — recognizes
+   * an approval surface by that attribute.
+   */
+  readonly key: string
   /** Tool the question is about. */
   readonly toolName: string
   /** The exact tool call, when the asker named one. */

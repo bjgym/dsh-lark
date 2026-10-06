@@ -206,12 +206,14 @@ export interface Config {
    * Tools chat agents may not call, denied per agent at execution with a
    * reason that redirects the model to the chat.
    *
-   * The default names the two human-interaction tools whose answers cannot
-   * reach this channel: `ctx.userQuestions` admits ONE provider per context,
-   * so when any other UI registered it (the Web app's BFF claims every
-   * agent-owned question) a chat agent's question would wait on a surface its
-   * human is not watching. Asking in the chat is the native equivalent — a
-   * reply is an ordinary message this bridge already turns into the next turn.
+   * Empty by default, because nothing needs denying any more: the two
+   * human-interaction tools this once named — `ask_user_question` and
+   * `exit_plan_mode` — are answered here without shadowing them. A question
+   * races this chat's card against whatever answerer follows (`user-questions`
+   * admits ONE provider per context, so a shadow would take the Web app's panel
+   * away), and a plan review is still answered by this channel's shadowed plan
+   * tool. A deployment that names either one denies it through the guard below,
+   * and the model is told to ask in prose instead.
    */
   denyTools?: string[]
   /**

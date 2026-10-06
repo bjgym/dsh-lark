@@ -408,6 +408,12 @@ export interface HostWorkspaceRegistry {
    * grouping surface". Optional for the same reason as {@link list}.
    */
   readonly archivedSessionIds?: readonly string[]
+  /**
+   * Drop one session from the archive set durably, which is what lifts the
+   * host's archived-session admission gate for it. Optional: a deployment
+   * composing a registry older than archival has nothing to lift.
+   */
+  unarchiveSession?(id: string): Promise<void>
 }
 
 /** One provider route, as the `llm` registry advertises it. */

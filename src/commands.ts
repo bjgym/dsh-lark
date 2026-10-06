@@ -66,7 +66,7 @@ export function helpText(commands: HostCommands | undefined, agent: HostAgent): 
   const own = [
     `\`/${STOP_COMMAND}\` — 停止当前任务`,
     `\`/${CD_COMMAND} <路径>\` — 切换本会话的工作区目录`,
-    `\`/${WS_COMMAND}\` — 查看可用工作区`,
+    `\`/${WS_COMMAND}\` — 选择工作区，点一行即切换`,
     `\`/${GET_COMMAND} <路径>\` — 把工作区里的文件发到聊天`,
     `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,

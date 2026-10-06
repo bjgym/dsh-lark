@@ -68,10 +68,13 @@ export function ApprovalPanel(props: LarkApprovalPanelProps & InjectFace<LarkApp
   const pending = props.useSessionStatus((snapshot: SessionStatusSnapshot) =>
     asPendingApproval(snapshot.get(props.matched.sessionId)?.pendingInteraction))
   const callId = props.matched.callId
-  // The command comes from the Chat store, the same source the shipped detail
-  // renders from. Replacing that panel replaces its detail too, and a person
-  // approving a shell call has to see what they are approving — an escalation
-  // granted without the command is a press that decides nothing knowable.
+// The command comes from the Chat store, the same source the shipped detail
+// renders from — the shipped `conversation.approval.detail` renderer is a
+// command extractor over this same snapshot, matched by call id on any phase
+// (a completed call still carries the command it was approved for), which is
+// why the narrowing below does not filter by phase. A person approving a
+// shell call has to see what they are approving — an escalation granted
+// without the command is a press that decides nothing knowable.
   const command = props.useChat((snapshot: ChatSnapshot) => commandForCall(snapshot, callId))
   // The asker's own explanation outranks this plugin's generic sentence, on the
   // same terms the shipped panel uses: it is the only text that says what this
@@ -98,7 +101,7 @@ function commandForCall(snapshot: ChatSnapshot, callId: string | undefined): str
   if (callId === undefined) return undefined
   for (const node of snapshot.nodes.values()) {
     const root = node.kind === 'tool-call' ? (node as ChatNode<'tool-call'>).data.root : undefined
-    if (root === undefined || 'kind' in root || root.phase !== 'start') continue
+    if (root === undefined || 'kind' in root) continue
     if (root.callId !== callId) continue
     return commandOf(root)
   }
@@ -107,12 +110,16 @@ function commandForCall(snapshot: ChatSnapshot, callId: string | undefined): str
 
 /**
  * Extract a shell command from one Tool call's raw arguments.
- * @param call - the started Tool call block, when a correlated call exists.
+ * @param call - the Tool call block, in whatever phase it currently reads.
  * @returns command text, or undefined for absent, malformed, or unrelated arguments.
  */
-function commandOf(call: { readonly argsRaw: string }): string | undefined {
+function commandOf(call: unknown): string | undefined {
+  const argsRaw = typeof call === 'object' && call !== null
+    ? (call as { readonly argsRaw?: unknown }).argsRaw
+    : undefined
+  if (typeof argsRaw !== 'string') return undefined
   try {
-    const args = JSON.parse(call.argsRaw) as Record<string, unknown>
+    const args = JSON.parse(argsRaw) as Record<string, unknown>
     return typeof args.command === 'string' ? args.command : undefined
   } catch {
     // Arguments that are not JSON carry no command to show; the panel still
@@ -193,17 +200,17 @@ function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {
 
   const inert = answered || settledElsewhere
   return (
-    <div className={css.root} data-lark-approval-key={matched.callId ?? matched.toolName} aria-busy={inert}
+    <div className={css.root} data-approval-key={matched.key} aria-busy={inert}
       onKeyDown={keydown}
       onKeyUpCapture={() => { compositionEnded.current = false }}
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false; compositionEnded.current = true }}>
       <div className={css.card}>
-        <div className={css.strip}>
+        <div className={`${css.strip}${settledElsewhere ? ` ${css.stripSettled}` : ''}`}>
           <StateDot state={settledElsewhere ? 'done' : answered ? 'ongoing' : 'warning'} />
           {settledElsewhere ? t('decidedElsewhere') : t('waiting')}
         </div>
-        <div className={css.body} tabIndex={0} role="group" aria-label={t('detail.aria')}>
+        <div className={css.body} data-approval-scroll tabIndex={0} role="group" aria-label={t('detail.aria')}>
           <div className={css.headline}>
             {reason ?? t('escalation', { toolName: matched.toolName })}
           </div>

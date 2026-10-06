@@ -33,8 +33,13 @@
         #                            # at most three of them undecided at a time
         # maxSendFileBytes: 20971520
         # hideProcessWhenDone: false # let the platform drop a finished process
-        # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here; send_file can be listed too
+        # denyTools: []              # tools denied per agent; empty by default — questions and
+        #                            # plan reviews are answered here; send_file can be listed too
         # syncSlashCommands: true    # publish commands to the bot's `/` panel
+        # diagnoseSessions: false    # report why /sessions admitted or withheld each candidate
+        # diagnosticsFile: ./logs    # file, or a directory holding dsh-lark-diagnostics.log;
+        #                            # absent keeps reports on the process terminal
+        # diagnosticsLevel: warn     # debug / info / warn / error
         # sessionScope: chat         # chat-thread / chat-sender split it finer
         requireMention: true
         # Authorization narrows; it does not gate. Who can reach the bot at all

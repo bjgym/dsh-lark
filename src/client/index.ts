@@ -50,6 +50,7 @@ import { ApprovalPanel } from './ApprovalPanel.tsx'
 import { QuestionPanel } from './QuestionPanel.tsx'
 import { SettledApprovalsRegistry, SettledSourceRegistry } from './decisions-source.ts'
 import { foldSettledQuestions, type SettledQuestion } from './question-decisions.ts'
+import { createQuestionDrafts } from './question-drafts.ts'
 import { createPanelFace, type DisplayReason, type PanelTarget } from './panel-store.ts'
 import { createQuestionFace, type QuestionSpec, type QuestionTarget } from './question-store.ts'
 import { en, enQuestion, zh, zhQuestion } from './locales.ts'
@@ -96,6 +97,11 @@ export function apply(ctx: ClientContext): void {
   const questionPanel = createQuestionFace(settledQuestions)
   ctx.effect(() => () => { settledQuestions.dispose() }, 'lark-ui: settled-question reads')
 
+  // The wizard's answer drafts, owned per apply() like the settled reads above:
+  // two assembled Clients in one process never share one conversation's drafts.
+  const questionDrafts = createQuestionDrafts()
+  ctx.effect(() => () => { questionDrafts.dispose() }, 'lark-ui: question drafts')
+
   // Register through slots.inject, not a bare register(): the composer chain
   // is declared by ui-conversation's own apply, and this fiber can activate
   // first — a direct register then throws "slot not declared" and fails the
@@ -129,6 +135,7 @@ export function apply(ctx: ClientContext): void {
       if (pending === undefined || pending.kind !== 'approval') return null
       return {
         sessionId,
+        key: pending.key,
         toolName: pending.toolName,
         ...pending.callId === undefined ? {} : { callId: pending.callId },
         ...pending.reason === undefined ? {} : { reason: pending.reason },
@@ -170,6 +177,7 @@ export function apply(ctx: ClientContext): void {
     locale: QUESTION_NS,
     inject: (sessionId) => ({
       panel: questionPanel,
+      drafts: questionDrafts,
       hooks: { larkQuestionSettled: questionPanel.settledSource(sessionId) },
     }),
   }, QuestionPanel))

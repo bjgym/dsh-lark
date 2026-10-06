@@ -20,9 +20,12 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 // The presentation half is not the subject here, and importing it would pull
 // the shared primitives library (whose own runtime dependencies live in the
 // shell, not in this repository). The wiring under test is what the
-// registration carries, so the component is replaced by an inert stand-in.
+// registration carries, so the components are replaced by inert stand-ins.
 vi.mock('../src/client/ApprovalPanel.tsx', () => ({
   ApprovalPanel: () => null,
+}))
+vi.mock('../src/client/QuestionPanel.tsx', () => ({
+  QuestionPanel: () => null,
 }))
 
 const { apply, inject: pluginInject, name: pluginName } = await import('../src/client/index.ts')
@@ -121,6 +124,15 @@ const approvalPending = (toolName: string, callId?: string) => ({
   ...(callId === undefined ? {} : { callId }),
   answerable: true,
   answer: vi.fn(async () => {}),
+})
+
+/** The pending question the Client projects for a session. */
+const questionPending = (questions: readonly unknown[]) => ({
+  kind: 'question',
+  key: 'question:1',
+  questions,
+  answer: vi.fn(async () => {}),
+  cancel: vi.fn(async () => {}),
 })
 
 /** The owner props the composer chain hands the selector. */
@@ -267,5 +279,72 @@ describe('apply', () => {
     expect(bound.getSnapshot()).toHaveLength(1)
     face.panel.markAnsweredHere(LARK, 'a')
     expect(bound.getSnapshot()).toEqual([])
+  })
+
+  describe('the question takeover it registers beside the approval one', () => {
+    const questions = [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }] }]
+
+    function questionRegistration() {
+      // The question entry is the second contribution into the chain.
+      return registrationsOf().find(entry => entry.options.locale === 'larkQuestion')!
+    }
+
+    function registrationsOf() {
+      // Re-applied per call so each test gets a fresh context; apply() twice on
+      // one context would double-register.
+      const mounted = clientContext(windowSource())
+      apply(mounted.ctx)
+      return mounted.registrations
+    }
+
+    it('joins the same chain ahead of the shipped question composer, on its own copy', () => {
+      const registrations = registrationsOf()
+      const registration = registrations.find(entry => entry.options.locale === 'larkQuestion')!
+      expect(registration).toBeDefined()
+      expect(registration.options.name).toBe('conversation.composer')
+      expect(registration.options.priority).toBe(0)
+      expect(typeof registration.options.select).toBe('function')
+      expect(typeof registration.options.inject).toBe('function')
+    })
+
+    it('claims a pending question with its render identity and question list', () => {
+      const registration = questionRegistration()
+      const select = registration.options.select as (owner: unknown) => unknown
+      expect(select(ownerProps(LARK, questionPending(questions))))
+        .toEqual({ sessionId: LARK, key: 'question:1', questions })
+    })
+
+    it('leaves plan reviews to the shipped panel', () => {
+      // This channel answers plans through its own shadowed tool in the chat,
+      // so only the generic question flow is claimed here.
+      const registration = questionRegistration()
+      const select = registration.options.select as (owner: unknown) => unknown
+      expect(select(ownerProps(LARK, { kind: 'plan-review', key: 'question:2', questions }))).toBeNull()
+    })
+
+    it('declines a pending interaction that is not a question', () => {
+      const registration = questionRegistration()
+      const select = registration.options.select as (owner: unknown) => unknown
+      expect(select(ownerProps(LARK, approvalPending('bash')))).toBeNull()
+    })
+
+    it('hands the component the settlement face, the drafts face, and a per-session settled read', () => {
+      const registration = questionRegistration()
+      const inject = registration.options.inject as (sessionId: SessionId) => {
+        panel: { markAnsweredHere: (sessionId: SessionId, requestId: string) => void }
+        drafts: { replace: (key: string, progress: unknown) => void, clear: (key: string) => void }
+        hooks: { larkQuestionSettled: { getSnapshot: () => unknown } }
+      }
+      const face = inject(LARK)
+      expect(typeof face.panel.markAnsweredHere).toBe('function')
+      expect(typeof face.drafts.replace).toBe('function')
+      expect(typeof face.drafts.clear).toBe('function')
+      expect(face.hooks.larkQuestionSettled.getSnapshot()).toEqual([])
+      // The drafts face is shared per apply(): a remount restores, so both
+      // mounts of the panel must read the same registry.
+      expect(inject(LARK).drafts).toBe(face.drafts)
+      // The settled source is per session, stable for the hook cache.
+      expect(inject(LARK).hooks.larkQuestionSettled).toBe(face.hooks.larkQuestionSettled)
+    })
   })
 })

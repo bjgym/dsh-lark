@@ -885,7 +885,11 @@ export function createFakeWorkspaces(
 ) {
   const created: string[] = []
   const attached: { workspaceId: string; sessionId: string }[] = []
+  const unarchived: string[] = []
   const state = { failAttach: false }
+  // Mutable, because the real archive set is a live registry-global set: a test
+  // archives a session after the plugin has already derived its id.
+  let archived: readonly string[] = archivedSessionIds
   const entity = (path: string, id: string) => ({
     id,
     path,
@@ -909,9 +913,20 @@ export function createFakeWorkspaces(
     list() {
       return Object.entries(registered).map(([path, id]) => entity(path, id))
     },
-    archivedSessionIds,
+    get archivedSessionIds() {
+      return archived
+    },
+    set archivedSessionIds(next: readonly string[]) {
+      archived = next
+    },
+    /** Drop one session from the archive set, as the real registry does durably. */
+    async unarchiveSession(sessionId: string) {
+      if (!archived.includes(sessionId)) return
+      unarchived.push(sessionId)
+      archived = archived.filter(id => id !== sessionId)
+    },
   }
-  return { service, created, attached, state }
+  return { service, created, attached, unarchived, state }
 }
 
 /** An in-memory `attachments` store recording every committed image. */
