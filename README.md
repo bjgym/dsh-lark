@@ -33,6 +33,53 @@ npm i -g @deepseek-ai/dsh
 
 无需公网服务器，也无需配置回调地址。
 
+## 从源码安装
+
+上面的快速开始装的是 npm 上的发布产物；这份仓库是插件源码，作为插件装进 DSH 走下面四步。
+
+**1. 前置。** Node.js `^22.19.0 || >=24`；DSH `0.2.0-rc.1` 或更新，没有就先装：
+
+```sh
+npm i -g @deepseek-ai/dsh
+```
+
+**2. 取源码并构建。** `lib/` 不在版本库里（见 `.gitignore`），而 `main`、`exports`、`bin` 都指向 `lib/`，所以构建是安装的前置条件：
+
+```sh
+git clone https://github.com/omdsh-dev/dsh-lark.git
+cd dsh-lark
+pnpm install
+pnpm build
+```
+
+`pnpm build` 产出 `lib/index.js`、`lib/cli.js`、`lib/invariant.js` 和网页半边的 `lib/client.js`；不要拿 `pnpm run prepare` 代替，它只出服务端那三个入口，不带网页半边。
+
+**3. 装进一个 profile。** `dsh plugin` 把参数转给 profile 目录里的 pnpm，相对路径按你当前所在的目录解析；profile 不存在时会以 `@deepseek-ai/dsh-base` 初始化，然后因为本包声明了 `dsh.bundle` 而把它追加进 `dsh.profile.bundles`，并以链接方式指向这份 checkout：
+
+```sh
+dsh plugin --profile web add .
+dsh --profile web --dump-config   # 可选：确认出现了 dsh-lark-channel 这一层
+```
+
+profile 名要选 `web` 才有网页端的审批与提问面板：为一个没有内置模板的 profile 名初始化时，只装 `dsh-base`。
+
+**4. 启动 DSH。**
+
+```sh
+dsh web        # 等同 dsh --profile web
+```
+
+首次启动若还没有凭据，二维码会打印在**这个终端**，用飞书扫码创建应用；也可以用 `LARK_APP_ID` / `LARK_APP_SECRET` 环境变量免扫码。扫码后私聊机器人，或在群里 @ 它。
+
+之后改了源码：`pnpm build` 后重启 `dsh web` 即可——profile 链接的就是这份 checkout，不需要重新 `add`。验证与卸载：
+
+```sh
+dsh plugin --profile web list
+dsh plugin --profile web remove dsh-lark-channel
+```
+
+> 仓库里的 `dsh-lark-channel` CLI（`lib/cli.js`）是给发布包用的：它按自身版本号从 npm 安装 `dsh-lark-channel`，不指向这份 checkout，所以源码安装不要走它。
+
 ## 为什么值得装
 
 - **不用守着终端**：从飞书发起任务，随时查看进度和结果。
@@ -65,7 +112,7 @@ Agent 的执行过程会显示在飞书中；需要你参与时，会发送提�
 | 能力 | 使用体验 |
 |---|---|
 | 持久会话 | 重启后可以恢复；后续消息继续当前上下文，`/new` 可以原地重开一个 |
-| 接续已有会话 | `/sessions` 列出这个工作区里可以接续的会话——自己的历史，以及网页端/命令行开的——点一行就切过去；`/cd`、`/new` 会回到自动派生的会话 |
+| 接续已有会话 | `/sessions` 分页列出这个工作区里可以接续的会话——自己的历史，以及网页端/命令行开的——点一行就切过去；一张卡片只接一次选择，要换一个就再发一次 `/sessions`；`/cd`、`/new` 会回到自动派生的会话。接上之后这个聊天会跟着显示那个会话的输出（网页端在跑的也一样），**切走就停**：它只镜像自己当前所在的会话，被留下的会话归原来那一端，照旧在跑 |
 | 多工作区 | `/ws` 打开工作区选择卡，点一行即切换；`/cd` 按名称或路径直接切；回到原工作区时继续之前的任务 |
 | 模型切换 | `/model` 打开模型选择卡片；切换后保留当前会话，也可随时恢复默认模型 |
 | 原生执行过程 | 在飞书中查看推理、工具调用和结果，最终答案单独发送 |
@@ -119,7 +166,7 @@ Agent 的执行过程会显示在飞书中；需要你参与时，会发送提�
 | `/permission` | 打开权限预设卡片 |
 | `/permission <预设名>` | 直接切换权限预设 |
 | `/new` | 原地开一个新会话，清空上下文，工作区和模型保持不变；若这个新会话此前被归档过，会先取消归档再开始 |
-| `/sessions` | 列出可接续的会话，点一行切过去 |
+| `/sessions` | 分页列出可接续的会话，点一行切过去；一张卡片只接一次选择 |
 | `/sessions <关键词>` | 按标题或 id 过滤列表 |
 | `/stop` | 停止当前任务 |
 | `/help` | 查看全部命令（含宿主提供的） |
@@ -210,6 +257,8 @@ pnpm install
 pnpm test
 pnpm build
 ```
+
+把这份源码装进 DSH 并启动，见[从源码安装](#从源码安装)。
 
 ## License
 

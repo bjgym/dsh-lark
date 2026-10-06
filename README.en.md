@@ -33,6 +33,53 @@ npm i -g @deepseek-ai/dsh
 
 No public server, no callback URL.
 
+## Install from source
+
+The quickstart above installs the released package from npm; this repository is the plugin's source. Installing it into DSH as a plugin takes four steps.
+
+**1. Prerequisites.** Node.js `^22.19.0 || >=24`, and DSH `0.2.0-rc.1` or newer — install it first if you have not:
+
+```sh
+npm i -g @deepseek-ai/dsh
+```
+
+**2. Clone and build.** `lib/` is not in the repository (see `.gitignore`), while `main`, `exports`, and `bin` all point into it, so the build is a prerequisite of the install:
+
+```sh
+git clone https://github.com/omdsh-dev/dsh-lark.git
+cd dsh-lark
+pnpm install
+pnpm build
+```
+
+`pnpm build` emits `lib/index.js`, `lib/cli.js`, `lib/invariant.js`, and the browser half's `lib/client.js`. Do not substitute `pnpm run prepare`: it emits only the three host entries and no browser half.
+
+**3. Install into a profile.** `dsh plugin` forwards its arguments to pnpm inside the profile directory, and a relative path is resolved against the directory you run it from; a profile that does not exist yet is initialized with `@deepseek-ai/dsh-base`, and because this package declares `dsh.bundle` it is appended to `dsh.profile.bundles` as a link to this checkout:
+
+```sh
+dsh plugin --profile web add .
+dsh --profile web --dump-config   # optional: shows a dsh-lark-channel layer
+```
+
+Name the profile `web` if you want the web-side approval and question panels: a profile name with no shipped template is initialized with `dsh-base` alone.
+
+**4. Boot DSH.**
+
+```sh
+dsh web        # same as dsh --profile web
+```
+
+On a first boot with no credentials yet, the QR code is printed in **that terminal** — scan it in Feishu to create the app — or set `LARK_APP_ID` / `LARK_APP_SECRET` to skip the scan. Then DM the bot or @-mention it in a group.
+
+After changing the source, `pnpm build` and restart `dsh web`: the profile links this checkout, so nothing needs re-adding. To verify or remove it:
+
+```sh
+dsh plugin --profile web list
+dsh plugin --profile web remove dsh-lark-channel
+```
+
+> The `dsh-lark-channel` CLI in this repository (`lib/cli.js`) serves the released package: it installs `dsh-lark-channel` from npm at its own version rather than this checkout, so a source install does not go through it.
+
 ## Why bother
 
 - **Nothing to sit and watch.** Start the work from Feishu and check on it whenever.
@@ -65,7 +112,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Capability | What you get |
 |---|---|
 | Durable sessions | Survive a restart; the next message continues where you were, and `/new` starts over in place |
-| Continue a session | `/sessions` lists what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; `/cd` and `/new` return it to the derived session |
+| Continue a session | `/sessions` pages through what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; a card accepts one pick, so switching again means sending `/sessions` again; `/cd` and `/new` return it to the derived session. Once it is on a session the chat also shows that session's output, a web-UI turn included, and **switching away stops it**: the chat mirrors only the session it is on, while the one it leaves stays with whoever was running it |
 | Workspaces | `/ws` opens a workspace picker where one press switches; `/cd` switches directly by name or path; returning to one resumes the work you left there |
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
@@ -119,7 +166,7 @@ The card is still sent and the two surfaces still race; when the web answers fir
 | `/permission` | Open the permission-preset picker |
 | `/permission <preset>` | Switch preset without opening a card |
 | `/new` | Start a fresh session in place; workspace and model stay, and a session archived earlier is restored before it starts |
-| `/sessions` | List the sessions this conversation may continue, one press each |
+| `/sessions` | Page through the sessions this conversation may continue, one press each; a card accepts one pick |
 | `/sessions <keyword>` | Filter that list by title or id |
 | `/stop` | Stop the running task |
 | `/help` | Everything this chat accepts, host commands included |
@@ -210,6 +257,8 @@ pnpm install
 pnpm test
 pnpm build
 ```
+
+To install this source into DSH and boot it, see [Install from source](#install-from-source).
 
 ## License
 

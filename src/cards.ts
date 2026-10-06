@@ -1015,6 +1015,24 @@ const SESSIONS = {
     zh: '还有 %s 个更早的会话，/sessions <关键词> 可按标题过滤',
     en: '%s older ones — /sessions <keyword> filters by title',
   },
+  previous: { zh: '上一页', en: 'Previous' },
+  next: { zh: '下一页', en: 'Next' },
+  switched: { zh: '已接续会话', en: 'Session continued' },
+  spent: { zh: '这张卡片已经选过了', en: 'This card has already been used' },
+  gone: { zh: '这个会话已不再可接续', en: 'That session is no longer offered' },
+  moved: { zh: '会话已移动', en: 'The conversation moved' },
+  decidedBy: { zh: '%s 里的对话 · 选择人：', en: 'Conversations in %s · chosen by ' },
+  // The row a settled pick keeps says what happened to it, in the same slot a
+  // settled current row states that it is the one in use.
+  continued: { zh: '已接续', en: 'Continued' },
+  received: {
+    zh: '你的下一条消息会接续这个会话；要换一个，发一次 /sessions。',
+    en: 'Your next message continues it — send /sessions again to pick another.',
+  },
+  closed: {
+    zh: '这张卡片已经结束，按钮不再可用。',
+    en: 'This card is closed; its buttons no longer work.',
+  },
   justNow: { zh: '刚刚', en: 'just now' },
   minutes: { zh: '%s 分钟前', en: '%s min ago' },
   hours: { zh: '%s 小时前', en: '%s h ago' },
@@ -1069,7 +1087,11 @@ function agoLabel(age: number): Copy {
 export function sessionsCard(input: {
   readonly rows: readonly SessionCardRow[]
   readonly workspace: string
+  /** Older ones the card does not draw; zero or absent when it pages instead. */
   readonly hidden?: number | undefined
+  /** The zero-based page drawn, and how many there are; both absent when it does not page. */
+  readonly page?: number | undefined
+  readonly pages?: number | undefined
   /** The keyword the list was narrowed by, so an empty one says which emptiness. */
   readonly keyword?: string | undefined
   /** The clock the relative labels are read against; injectable for tests. */
@@ -1077,6 +1099,8 @@ export function sessionsCard(input: {
   /** False when the deployment composes no query service at all. */
   readonly canList?: boolean | undefined
   readonly valueFor: (sessionId: string) => object
+  /** Payload for a page control; absent leaves the card unpaged. */
+  readonly pageValueFor?: ((page: number) => object) | undefined
 }): object {
   const now = input.now ?? Date.now()
   /**
@@ -1085,23 +1109,43 @@ export function sessionsCard(input: {
    * instead of offering a press, the same way every settled row here does.
    */
   const rowFor = (row: SessionCardRow): object => {
-    const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
-    const notes = [
-      row.when === undefined ? undefined : agoLabel(now - row.when),
-      row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
-      row.live && !row.current ? SESSIONS.elsewhere : undefined,
-    ].filter((note): note is Copy => note !== undefined)
-    const detail = notes.length === 0
-      ? undefined
-      : { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') }
+    const text = sessionRowText(row, now)
     return row.current
-      ? settledRow(label, detail, SESSIONS.inUse, INK.info.token)
-      : optionRow({ label, description: detail }, input.valueFor(row.id))
+      ? settledRow(text.label, text.detail, SESSIONS.inUse, INK.info.token)
+      : optionRow({ label: text.label, description: text.detail }, input.valueFor(row.id))
   }
 
   /** A cluster's quiet heading; nothing is drawn for a cluster with no rows. */
   const group = (heading: Copy, rows: readonly SessionCardRow[]): object[] =>
     rows.length === 0 ? [] : [line(heading, SIZE.label, '16px 20px 2px 20px', 'grey'), ...rows.map(rowFor)]
+
+  /**
+   * The page strip, drawn only where the list is actually paged: a card whose
+   * rows are the whole list has nothing to turn to, and a control that cannot
+   * move would be a button for a no-op.
+   */
+  const pager = (): object[] => {
+    const page = input.page
+    const pages = input.pages
+    if (page === undefined || pages === undefined || pages <= 1 || input.pageValueFor === undefined) return []
+    return [
+      // Built rather than filled from a `%s / %s` template, because `fill`
+      // substitutes only the first placeholder — the shape `workspacesCard`'s
+      // page strip already uses.
+      line(
+        { zh: `第 ${page + 1} / ${pages} 页`, en: `Page ${page + 1} of ${pages}` },
+        SIZE.label,
+        '14px 20px 0px 20px',
+        'grey',
+      ),
+      ...page > 0
+        ? [optionRow({ label: SESSIONS.previous }, input.pageValueFor(page - 1))]
+        : [],
+      ...page < pages - 1
+        ? [optionRow({ label: SESSIONS.next }, input.pageValueFor(page + 1))]
+        : [],
+    ]
+  }
 
   const here = input.rows.filter(row => row.own)
   const elsewhere = input.rows.filter(row => !row.own)
@@ -1121,6 +1165,7 @@ export function sessionsCard(input: {
           ? [line(SESSIONS.none, SIZE.body, '14px 20px 0px 20px', 'grey')]
           : []
       : grouped,
+    ...pager(),
     ...input.hidden === undefined || input.hidden <= 0
       ? []
       : [line(fill(SESSIONS.more, String(input.hidden)), SIZE.label, '10px 20px 0px 20px', 'grey')],
@@ -1241,6 +1286,86 @@ export function workspacesCard(input: {
 }
 
 /**
+ * The label and the fact line one session row shows.
+ *
+ * Shared with the settled card so a chosen conversation is named by exactly the
+ * words the row that chose it carried: a picker and its own record must not be
+ * able to disagree about which conversation was picked.
+ * @param row - the row as the bridge resolved it.
+ * @param now - the clock the relative label is read against.
+ * @returns the label, and the fact line when there is one.
+ */
+function sessionRowText(row: SessionCardRow, now: number): { readonly label: Line; readonly detail?: Copy | undefined } {
+  const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
+  const notes = [
+    row.when === undefined ? undefined : agoLabel(now - row.when),
+    row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
+    row.live && !row.current ? SESSIONS.elsewhere : undefined,
+  ].filter((note): note is Copy => note !== undefined)
+  return {
+    label,
+    ...notes.length === 0
+      ? {}
+      : { detail: { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') } },
+  }
+}
+
+/**
+ * One rendered line in each language, for a summary that lives outside the card
+ * and therefore carries no localization of its own.
+ * @param value - our copy, or text from elsewhere shown as it arrived.
+ * @returns the same words, once per language.
+ */
+function bothWays(value: Line): Copy {
+  return isCopy(value) ? { zh: value.zh, en: value.en } : { zh: value, en: value }
+}
+
+/**
+ * The card a session pick is replaced with once chosen.
+ *
+ * No live buttons, and the choice legible from the ink alone — the same shape
+ * every single-use card here settles into. The row is kept rather than dropped
+ * for the reason the question card keeps its answer: a label is clipped, and a
+ * reader has to be able to confirm which conversation they landed on.
+ * @param input - the row chosen, the workspace, who pressed, and why nothing was.
+ * @returns a schema 2.0 card object.
+ */
+export function settledSessionsCard(input: {
+  /** The row the press landed on; absent when nothing was chosen. */
+  readonly picked?: SessionCardRow | undefined
+  readonly workspace: string
+  /** Who chose, when the conversation is a room's rather than one person's. */
+  readonly decidedBy?: string | undefined
+  /** Why nothing was chosen, when the press could not land. */
+  readonly refusal?: 'spent' | 'gone' | 'moved' | undefined
+  /** The clock the relative label is read against; injectable for tests. */
+  readonly now?: number | undefined
+}): object {
+  const state: CardState = input.refusal === undefined ? 'success' : 'neutral'
+  const title = input.refusal === undefined ? SESSIONS.switched : SESSIONS[input.refusal]
+  const where = workspaceLabel(input.workspace)
+  // Who chose is named rather than withheld, the way a settled approval names
+  // its decider: where anyone in a room may drive the conversation, the room
+  // should see whose press moved it.
+  const context = input.decidedBy === undefined || input.decidedBy === ''
+    ? fill(SESSIONS.context, where)
+    : join(fill(SESSIONS.decidedBy, where), input.decidedBy)
+  const text = input.picked === undefined ? undefined : sessionRowText(input.picked, input.now ?? Date.now())
+  const named = text === undefined ? { zh: '', en: '' } : bothWays(text.label)
+  return card(state, { zh: `${title.zh}：${named.zh}`, en: `${title.en}: ${named.en}` }, [
+    ...heading(state, title, context),
+    ...text === undefined
+      ? []
+      // The CARD's own ink, never another state's: a card declares only the one
+      // colour pair it uses, so a row borrowing `INK.info.token` into a card
+      // that declares `success` or `neutral` renders nothing and fails the
+      // whole card at the platform.
+      : [settledRow(text.label, text.detail, SESSIONS.continued, INK[state].token)],
+    ...footer(input.refusal === undefined ? SESSIONS.received : SESSIONS.closed),
+  ])
+}
+
+/**
  * A workspace as a subtitle names it: the last two path segments.
  *
  * A whole absolute path in a subtitle is longer than the title, wraps on a
@@ -1272,6 +1397,7 @@ export const TOAST = {
   sessionSwitched: { zh: '已切过去，下一条消息接续', en: 'Switched — your next message continues it' },
   sessionOwn: { zh: '已回到这个聊天自己的会话', en: "Back on this chat's own session" },
   sessionGone: { zh: '这个会话已经不在可接续列表里了', en: 'That session is no longer on offer here' },
+  sessionCardSpent: { zh: '这张卡片已经选过了', en: 'This card has already been used' },
   workspaceSwitched: { zh: '已切换工作区，下一条消息在新目录', en: 'Workspace switched — your next message runs there' },
   workspaceSame: { zh: '本会话已经在这个目录', en: 'This conversation already runs there' },
   workspaceRefused: { zh: '这个目录不能用作工作区', en: 'That directory cannot be a workspace' },

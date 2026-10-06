@@ -25,10 +25,12 @@ import {
   settledApprovalCard as buildSettledApprovalCard,
   settledFileApprovalCard as buildSettledFileApprovalCard,
   settledPermissionCard,
+  settledSessionsCard,
   toast,
   TOAST,
   workspacesCard,
 } from './cards.ts'
+import type { SessionCardRow } from './cards.ts'
 import type { ResolvedConfig } from './config.ts'
 import type {
   HostAgent,
@@ -43,6 +45,7 @@ import type {
   HostLlm,
   HostLoader,
   HostPermissionPresets,
+  HostSessionProjectionCache,
   HostSessionQuery,
   HostSessionEvent,
   HostSessionProjections,
@@ -65,7 +68,10 @@ import type { CotPort } from './cot.ts'
 import { createMessageRenderer, createStreamRenderer, replyOptions } from './outbound.ts'
 import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
 import { refuseApprovalClick, refuseMessage } from './authorization.ts'
-import { marked } from './clicks.ts'
+import {
+  cardMarker,
+  marked,
+} from './clicks.ts'
 import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './maintenance.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
@@ -82,12 +88,14 @@ import {
 import type { WorkspaceActionValue } from './workspace.ts'
 import {
   ChatSessionPicks,
+  EMPTY_OFFER,
   offerSessions,
   sessionActionValue,
+  sessionsPage,
   SESSIONS_ACTION,
   SESSIONS_COMMAND,
 } from './sessions.ts'
-import type { OfferedSessions, SessionActionValue } from './sessions.ts'
+import type { FactSources, OfferedSessions, SessionActionValue, SessionChoice, SessionOffer } from './sessions.ts'
 import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
 import {
   ChatModels,
@@ -1368,7 +1376,7 @@ export function installBridge(
   let unwound = false
 
   /**
-   * In-flight and settled binding creations, one per session id. A plain
+   * In-flight and settled binding creations, one per (chat, session). A plain
    * check-then-create raced two concurrent callers into two renderers, one of
    * them orphaned but still aimed at — the same promise-cache pattern the
    * compositions use makes creation single-flight. A model switch resumes the
@@ -1376,12 +1384,27 @@ export function installBridge(
    * calls through the preset's view, which a model change does not alter.
    */
   const bindings = new Map<string, Promise<ChatBinding>>()
+  /** One chat's watch on one session, as the key of the state that surrounds it. */
+  const watchKey = (chatId: string, sessionId: string): string => `${chatId}\u0000${sessionId}`
+  /**
+   * Binding generation per (chat, session), advanced when that chat stops
+   * watching that session.
+   *
+   * Creation is asynchronous, so a renderer still composing when the
+   * conversation moves on would claim the dispatch slot afterwards and start
+   * rendering a session the chat has already left. The creation carries the
+   * generation it started under; a mismatch settles what it opened and claims
+   * nothing.
+   */
+  const bindingGenerations = new Map<string, number>()
   const bindingFor = (
     sessionId: string,
     chat: { readonly chatId: string; readonly chatType: string },
   ): Promise<ChatBinding> => {
-    let pending = bindings.get(sessionId)
+    const watch = watchKey(chat.chatId, sessionId)
+    let pending = bindings.get(watch)
     if (pending === undefined) {
+      const generation = bindingGenerations.get(watch) ?? 0
       pending = (async (): Promise<ChatBinding> => {
         const { presentCall } = await compositionFor(sessionId)
         // The renderer is the composition's last reader; dropping it here leaves
@@ -1398,17 +1421,61 @@ export function installBridge(
           void binding.renderer.close()
           throw new Error('lark-channel: bridge unwound while binding')
         }
+        if ((bindingGenerations.get(watch) ?? 0) !== generation) {
+          // The conversation left this session while its renderer was composing:
+          // the chat has already stopped watching it, so this one settles its
+          // card and claims nothing.
+          void binding.renderer.close()
+          return binding
+        }
         bySession.set(sessionId, binding)
         return binding
       })()
-      bindings.set(sessionId, pending)
+      bindings.set(watch, pending)
       pending.catch(() => {
         // Only the failure that still owns the slot clears it: a stale
         // rejection must not evict a successor's live promise.
-        if (bindings.get(sessionId) === pending) bindings.delete(sessionId)
+        if (bindings.get(watch) === pending) bindings.delete(watch)
       })
     }
     return pending
+  }
+
+  /**
+   * Stop one chat watching the session its conversation has left.
+   *
+   * A binding is what routes a session's events into a chat, and it used to
+   * outlive the conversation's own stay: the chat that switched away kept
+   * rendering the session it left — its stream, its approvals, its questions —
+   * beside the one it moved to, so one chat carried two conversations at once.
+   * This is that half of a binding's life, and it runs where the conversation's
+   * session identity changes and nowhere else: `/model` resumes the SAME id and
+   * reuses its renderer on purpose, so releasing an agent is not by itself a
+   * reason to stop watching.
+   *
+   * The session itself keeps running. It belongs to whoever opened it — a
+   * browser, a schedule — and only that owner decides when it stops.
+   * @param key - the conversation that moved, resolved fresh so a move that
+   * lands on the same session leaves the renderer where it is.
+   * @param chatId - the chat whose renderer goes away.
+   * @param left - the session id the conversation was on before the move.
+   */
+  const stopWatching = async (key: string, chatId: string, left: string): Promise<void> => {
+    // Not a change of session: `/cd` to the directory the conversation is
+    // already in, or a press on the row it is already on.
+    if (left === sessionIdOf(key)) return
+    const watch = watchKey(chatId, left)
+    bindingGenerations.set(watch, (bindingGenerations.get(watch) ?? 0) + 1)
+    // Dropped from the creation cache as well, so a later `bindingFor` on this
+    // pair builds a renderer of its own instead of handing back this one.
+    bindings.delete(watch)
+    const binding = bySession.get(left)
+    // Another chat's watch on the same session is that chat's to give up.
+    if (binding === undefined || binding.chatId !== chatId) return
+    // Out of the dispatch table BEFORE the card settles: an event that lands
+    // while the card is closing must find nobody home.
+    bySession.delete(left)
+    await binding.renderer.close()
   }
 
   /**
@@ -1867,6 +1934,11 @@ export function installBridge(
         // deliberate — this side disposed the agent, so "nothing is running"
         // is a synchronous fact, and the closing event of an aborted turn is
         // not guaranteed to arrive.
+        // The session the conversation is on BEFORE the command moves it, for
+        // the binding that has to go with it. Captured here for the same reason
+        // as the release below: `/cd` and `/new` both re-derive the id, and the
+        // id that has to be let go of is the old one.
+        const left = sessionIdOf(key)
         const release = releaseFor(key)
         const subject = subjectOf(msg)
         let reply: { markdown: string } | { card: object }
@@ -1880,6 +1952,7 @@ export function installBridge(
           const moved = async (): Promise<void> => {
             await chatSessionPicks.set(key, undefined)
             await release()
+            await stopWatching(key, msg.chatId, left)
           }
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, moved) }
         } else if (channelCommand === WS_COMMAND) {
@@ -1892,7 +1965,11 @@ export function installBridge(
           // Same reason, more bluntly: `/new` asks for a session that has no
           // history, which is the opposite of continuing one.
           await chatSessionPicks.set(key, undefined)
-          reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
+          const moved = async (): Promise<void> => {
+            await release()
+            await stopWatching(key, msg.chatId, left)
+          }
+          reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, moved) }
         } else if (channelCommand === MODEL_COMMAND) {
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
@@ -2596,6 +2673,9 @@ export function installBridge(
       return { card: { type: 'raw', data: painted.card } }
     }
     const before = conversationStamp(value.key)
+    // The session the conversation is on before the directory moves, so the
+    // chat stops watching it: a workspace switch is a session change.
+    const left = sessionIdOf(value.key)
     const release = releaseFor(value.key)
     const result = await chatWorkspaces.switch(value.key, value.path)
     if (!result.ok) {
@@ -2613,12 +2693,11 @@ export function installBridge(
     }
     // The directory moved, so this conversation's next message must walk the
     // ladder under the new id: the pick it may have been holding points at a
-    // session in the directory it just left, and the cached session list is a
-    // list of THAT directory's sessions.
+    // session in the directory it just left.
     await chatSessionPicks.set(value.key, undefined)
-    lastOffered.delete(value.key)
     if (conversationStamp(value.key) !== before) notify(`lark-channel: ${value.key} moved twice quickly`)
     await release()
+    await stopWatching(value.key, value.chatId, left)
     diag('info', `lark-channel: ${value.key} switched workspace to ${result.path}`)
     notify(`lark-channel: ${value.key} switched to ${result.path}`)
     return {
@@ -2628,16 +2707,48 @@ export function installBridge(
   }
 
   /**
-   * Continue the session one row named.
+   * The session cards already spent by a pick.
+   *
+   * A card is single-use: the rows it carries were authorized by one derivation,
+   * and the pick retires that card rather than redrawing it with new buttons. A
+   * press arriving afterwards — the platform redelivering one, or a card whose
+   * terminal repaint never reached the chat — must not resume a list this
+   * conversation has already moved on from.
+   */
+  const spentSessionCards = new Set<string>()
+
+  /** Bound on the marks kept, so a long-lived process cannot grow this forever. */
+  const SPENT_CARDS_MAX = 256
+
+  /**
+   * Record one rendering as spent, dropping the oldest mark once the bound is
+   * reached. Oldest-first is exact: a mark is only ever added once, and the
+   * insertion order of a `Set` is the order its keys were added.
+   * @param mark - the rendering's mark, as the pressed payload carried it.
+   */
+  const spendSessionCard = (mark: string): void => {
+    if (spentSessionCards.size >= SPENT_CARDS_MAX) {
+      const oldest = spentSessionCards.values().next().value
+      if (oldest !== undefined) spentSessionCards.delete(oldest)
+    }
+    spentSessionCards.add(mark)
+  }
+
+  /**
+   * Answer one session card press: continue a row, or turn a page.
    *
    * The payload's id is not trusted: the same list is derived again and the id
    * must still be in it. A card outlives the state it was drawn from — a
    * session can be archived, a `/cd` can move the conversation elsewhere — and
    * the only thing that may resume a session here is a row this conversation
    * would be offered NOW.
-   * @param value - the payload the pressed row carried.
+   *
+   * Every exit settles the card, including the ones that chose nothing: a card
+   * whose press could not land has just proved the list behind it stale, and
+   * redrawing it live would invite a second press on that same stale list.
+   * @param value - the payload the pressed row or page control carried.
    * @param evt - the click, for authorization and the operator log.
-   * @returns the toast and the repainted picker.
+   * @returns the toast and the card the press settles into.
    */
   const continueSession = async (
     value: SessionActionValue,
@@ -2648,23 +2759,48 @@ export function installBridge(
       notify(`lark-channel: rejected a session switch: ${refusal}`)
       return { toast: toast('error', TOAST.notYours) }
     }
+    // Checked before the page arm as well: a spent card's page control is a
+    // button on a card that is already closed.
+    if (spentSessionCards.has(value.a)) {
+      notify(`lark-channel: ${value.key} pressed a session card that was already used`)
+      return {
+        toast: toast('info', TOAST.sessionCardSpent),
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'spent',
+          }),
+        },
+      }
+    }
+    // A page control moves nothing: it repaints the same list, one page along,
+    // and reads the corpus again so what it draws is the corpus as it is now.
+    if (value.page !== undefined) {
+      return { card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', value.page) } }
+    }
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
     const before = conversationStamp(value.key)
-    // ONE derivation per press, shared by the authorization check and the
-    // repaint. Deriving twice was the original shape and it is what timed the
-    // platform's callback out: the list is read from every candidate's whole
-    // log — one workspace here holds a 47 MB session — so a second derivation
-    // doubles a cost that already ran past the callback's budget. Deriving not
-    // at all is equally wrong: the rows a press may name are exactly the rows
-    // this list draws, and the paint has to come from the same answer.
-    const offered = await cachedOfferedSessions(value.key)
+    // The session the conversation is on if this press lands, so the chat stops
+    // watching the one it leaves at the same moment it starts on the new one.
+    const left = sessionIdOf(value.key)
+    // ONE derivation per press, and it is a FRESH one. The rows a press may name
+    // are exactly the rows this list holds, and a card outlives the corpus it
+    // was drawn from — so the list is read now rather than reused from the card.
+    const offered = await derive(value.key)
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
-      notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
+      notify(`lark-channel: ${String(value.session)} is no longer offered to ${value.key}`)
       return {
         toast: toast('info', TOAST.sessionGone),
-        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'gone',
+          }),
+        },
       }
     }
     // The workspace still has to be the one this row was offered under. A card
@@ -2675,7 +2811,13 @@ export function installBridge(
       notify(`lark-channel: ${value.key} left ${value.workspace} since that card was drawn`)
       return {
         toast: toast('info', TOAST.sessionGone),
-        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'moved',
+          }),
+        },
       }
     }
     // The derived one is not an override: picking it is how a conversation
@@ -2693,10 +2835,21 @@ export function installBridge(
       notify(`lark-channel: ${value.key} moved while a session switch was in flight`)
       return {
         toast: toast('info', TOAST.sessionGone),
-        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'moved',
+          }),
+        },
       }
     }
     await chatSessionPicks.set(value.key, choice.id === derived ? undefined : choice.id)
+    // And it stops watching the one it left, in the same step. A pick is an
+    // override on the derived session, so the conversation it was on before is
+    // still live somewhere — a browser, a schedule — and it used to go on
+    // rendering into this chat beside the session just picked.
+    await stopWatching(value.key, value.chatId, left)
     // The chat now claims that conversation, so it starts watching it here
     // rather than on its next message. A binding is what routes a session's
     // events to this chat, and until one exists every event of that session is
@@ -2712,24 +2865,35 @@ export function installBridge(
     if (choice.id !== derived) {
       await bindingFor(choice.id, { chatId: value.chatId, chatType: value.chatType })
     }
-    // Dropped rather than updated: the rows themselves are unchanged, but one of
-    // them just became the current one, and a cached list would paint the card
-    // with the row the person moved TO still looking like an option. The next
-    // derivation is the fresh answer, and nothing between here and then needs the
-    // old one.
-    lastOffered.delete(value.key)
+    // The card is spent the moment the pick lands, not before it: a press that
+    // failed above must leave the card answerable by another.
+    spendSessionCard(value.a)
     // Recorded, not just announced: the press succeeds and the failure arrives
     // later, on the next message, when the pick is finally resumed. Without this
     // line an operator sees a switch that reported success and a chat that then
     // refused to continue, with nothing tying the two together.
     diag('info', `lark-channel: ${value.key} picked ${choice.id === derived ? 'its own session' : choice.id}`)
     notify(`lark-channel: ${value.key} continues ${choice.id}`)
+    // The settled card rides the click's own response, exactly as a decided
+    // approval does: the patch API reports refusals in a body the SDK discards,
+    // so a repaint that failed would be invisible — and a card left showing live
+    // buttons after its pick is worse than any toast.
     return {
       toast: toast('success', choice.id === derived ? TOAST.sessionOwn : TOAST.sessionSwitched),
-      // Painted from the derivation this press was authorized against: the facts
-      // behind each row cannot have changed in between, and the one thing that
-      // did — which row is current — is read fresh inside.
-      card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+      card: {
+        type: 'raw',
+        data: settledSessionsCard({
+          // Labelled from the same derivation the press was authorized against,
+          // so the card cannot name a different conversation than the one the
+          // pick wrote.
+          picked: cardRowFor(offered.label([choice])[0] ?? choice, chatWorkspaces.sessionIdFor(value.key)),
+          workspace: chatWorkspaces.pathFor(value.key),
+          // Named only where the conversation is a room's: telling one person
+          // their own name back is noise, and the gate that matters is the
+          // control gate, not this line.
+          ...value.owner === undefined ? { decidedBy: await resolveApprovalDecider(evt) } : {},
+        }),
+      },
     }
   }
 
@@ -2757,55 +2921,100 @@ export function installBridge(
   })
 
   /**
+   * What this conversation may continue, as one derivation.
+   * @param key - the conversation key.
+   * @param keyword - optional filter over titles and ids.
+   * @returns the derivation, or an empty one where nothing can be listed.
+   */
+  const derive = async (key: string, keyword = ''): Promise<OfferedSessions> => {
+    const offer = offerFor(key, keyword)
+    return offer === undefined ? EMPTY_OFFER : await offerSessions(offer)
+  }
+
+  /**
+   * One derived row as the card's own row type.
+   * @param choice - the derived row.
+   * @param current - the session this conversation resolves to right now.
+   * @returns the row the card renders, and the settled card names.
+   */
+  const cardRowFor = (choice: SessionChoice, current: string): SessionCardRow => ({
+    id: choice.id,
+    ...choice.title === undefined ? {} : { title: choice.title },
+    ...choice.lastSaid === undefined ? {} : { lastSaid: choice.lastSaid },
+    ...choice.turns === undefined ? {} : { turns: choice.turns },
+    // Last movement, not creation: "recent" in a list of conversations
+    // means the one you were just in, not the one you opened first.
+    ...(choice.lastActive ?? choice.createdAt) === undefined
+      ? {}
+      : { when: choice.lastActive ?? choice.createdAt },
+    live: choice.live,
+    own: choice.own,
+    // Read now rather than taken from the row: a repaint follows the press
+    // that moved it, and the row was derived before that.
+    current: choice.id === current,
+  })
+
+  /**
    * The picker for one conversation: what it may continue, and one press each.
    *
    * Everything the card offers is resolved here, because the list IS the
    * authorization — a row that never appears cannot be pressed.
    * @param subject - the conversation the card is built for.
    * @param line - the command line, so a keyword can narrow the list.
-   * @param derived - a list already derived for this conversation, to repaint
-   * from instead of reading every session's log a second time.
+   * @param page - the zero-based page to draw; out-of-range values clamp.
+   * @param derived - a derivation the caller already made for this conversation,
+   * so a repaint after a press does not read the corpus a second time. Only the
+   * row marked current is read fresh inside.
    * @returns the card to send.
    */
   const sessionPicker = async (
     subject: ConversationSubject,
     line = '',
+    page = 0,
     derived?: OfferedSessions,
   ): Promise<object> => {
     const keyword = line.trimStart().replace(/^\/\S+\s*/, '').trim()
-    const offered = derived ?? await cachedOfferedSessions(subject.key, keyword)
+    const listed = derived ?? await derive(subject.key, keyword)
+    const sliced = sessionsPage(listed, page)
+    // Labelled after the slice: what a conversation was last about is the one
+    // fact whose state grows with the session, so it is read for the rows the
+    // card draws rather than for the whole corpus.
+    const drawn = listed.label(sliced.rows)
     const current = sessionIdOf(subject.key)
+    // ONE mark for every control on this rendering, because the card is
+    // single-use: the first pick retires it, and a press arriving afterwards
+    // has to be recognizable as one of ITS buttons rather than just as some
+    // well-formed payload. Turning a page mints a new card, so paging is
+    // unaffected.
+    const stamp = cardMarker()
     return sessionsCard({
-      rows: offered.rows.map(choice => ({
-        id: choice.id,
-        ...choice.title === undefined ? {} : { title: choice.title },
-        ...choice.lastSaid === undefined ? {} : { lastSaid: choice.lastSaid },
-        ...choice.turns === undefined ? {} : { turns: choice.turns },
-        // Last movement, not creation: "recent" in a list of conversations
-        // means the one you were just in, not the one you opened first.
-        ...(choice.lastActive ?? choice.createdAt) === undefined
-          ? {}
-          : { when: choice.lastActive ?? choice.createdAt },
-        live: choice.live,
-        own: choice.own,
-        // Read now rather than taken from the row: a repaint follows the press
-        // that moved it, and the row was derived before that.
-        current: choice.id === current,
-      })),
+      rows: drawn.map(choice => cardRowFor(choice, current)),
       workspace: chatWorkspaces.pathFor(subject.key),
-      hidden: offered.hidden,
+      page: sliced.page,
+      pages: sliced.pages,
+      // Only a list that cannot be paged reports what it left out; a paged one
+      // draws every row it has, so a count beside it would name nothing.
+      hidden: listed.complete ? 0 : listed.hidden,
       ...keyword === '' ? {} : { keyword },
       canList: sessionQuery() !== undefined,
       // The row's own id LAST: a caller may hand in a payload that already
       // carries one — the click handler repaints from the value it was given —
       // and spreading that over the row would point every button at the
       // session someone just pressed.
-      valueFor: session => marked({
+      valueFor: session => stamp({
         kind: SESSIONS_ACTION,
         ...subject,
         session,
         // The workspace each row was offered under, so a press is authorized
         // against what the card actually showed without re-deriving the list.
+        workspace: chatWorkspaces.pathFor(subject.key),
+      }),
+      // The same payload kind carries a page control, so the dispatcher has one
+      // arm to reach and a foreign card cannot forge either.
+      pageValueFor: target => stamp({
+        kind: SESSIONS_ACTION,
+        ...subject,
+        page: target,
         workspace: chatWorkspaces.pathFor(subject.key),
       }),
     })
@@ -2864,54 +3073,14 @@ export function installBridge(
   }
 
   /**
-   * The last list derived for one conversation, and what it was derived under.
+   * What this conversation may continue right now, as the offer `sessions.ts`
+   * derives from.
    *
-   * A derivation is expensive out of proportion to what it returns: listing the
-   * corpus re-reads every session's HEADER, and this deployment holds 233 of
-   * them behind zstd — measured at about three seconds, nearly all of it in the
-   * listing rather than in the per-candidate reads. A card callback has a budget
-   * of a few seconds and the platform drops one that overruns, which the presser
-   * sees as "the callback service timed out".
-   *
-   * So a press reuses the list its own card was drawn from, whenever that list
-   * still describes this conversation. The stamp is the guard: `/cd`, `/new` and
-   * a pick all move it, and a stale entry is discarded rather than reused.
-   */
-  const lastOffered = new Map<string, { readonly stamp: string; readonly at: number; readonly offered: OfferedSessions }>()
-
-  /**
-   * How long a derivation stays reusable.
-   *
-   * Long enough to cover the gap between a card being drawn and pressed — which
-   * includes composing a turn, so seconds rather than milliseconds — and short
-   * enough that a list is never materially out of date.
-   */
-  const OFFERED_TTL_MS = 120_000
-
-  /**
-   * What this conversation may continue, reusing a derivation still in date.
-   *
-   * A keyword always derives: its answer is not what any cached one holds.
-   * @param key - the conversation key.
-   * @param keyword - optional filter over titles and ids.
-   * @returns the rows to offer and the hidden count.
-   */
-  const cachedOfferedSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
-    if (keyword !== '') return await offeredSessions(key, keyword)
-    const entry = lastOffered.get(key)
-    if (entry !== undefined && entry.stamp === conversationStamp(key) && Date.now() - entry.at < OFFERED_TTL_MS) {
-      return entry.offered
-    }
-    const offered = await offeredSessions(key, keyword)
-    // Stamped AFTER the derivation, not before: a `/cd` landing while it ran must
-    // not be recorded as this list's basis, or the next press would reuse rows
-    // from the directory the conversation has left.
-    lastOffered.set(key, { stamp: conversationStamp(key), at: Date.now(), offered })
-    return offered
-  }
-
-  /**
-   * What this conversation may continue right now.
+   * Re-derived on every render and every press rather than reused: the list is
+   * the authorization, and a list remembered from an earlier draw authorizes
+   * rows the conversation may have outgrown. That was only affordable once the
+   * host began handing back what it already folds — a derivation is now one
+   * corpus listing and, per drawn row, one stored projection read.
    *
    * The conversation's half of {@link offerSessions}: which chat, which
    * workspace, and what this deployment lets us read. The rule itself lives in
@@ -2919,14 +3088,15 @@ export function installBridge(
    * running channel.
    * @param key - the conversation key.
    * @param keyword - optional filter over titles and ids.
-   * @returns the rows to offer and the hidden count.
+   * @returns the offer to derive from, or undefined where nothing can be listed.
    */
-  const offeredSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
+  const offerFor = (key: string, keyword = ''): SessionOffer | undefined => {
     const query = sessionQuery()
-    if (query === undefined) return { rows: [], hidden: 0 }
+    if (query === undefined) return undefined
     const diagnose = config.diagnoseSessions === true
-    return offerSessions({
+    return {
       query,
+      sources: sessionSources(),
       scope: {
         base: sessionIdFor(key, instanceIdentity(config.instance).sessionPrefix),
         current: sessionIdOf(key),
@@ -2942,8 +3112,23 @@ export function installBridge(
       // is usually asked long after the window that ran the bot was closed.
       report: diagnose ? (line) => { diag('warn', line); notify(line) } : notify,
       ...diagnose ? { diagnose: true } : {},
-    })
+    }
   }
+
+  /**
+   * The days of `offerSessions` that live on the host.
+   *
+   * `liveSession` is what makes a running session's row exact rather than as
+   * stale as its last checkpoint: the registry holds the cells of every session
+   * this process has attached, and this channel already asks it for other
+   * readouts.
+   * @returns the cache faces this deployment composes; every one is optional.
+   */
+  const sessionSources = (): FactSources => ({
+    cache: ctx.get('sessionProjectionCache') as HostSessionProjectionCache | undefined,
+    projections: projections(),
+    liveSession: id => sessions.agentFor(id)?.session,
+  })
 
   /**
    * Whether one preset switch may proceed, wherever it was asked from.
@@ -3466,6 +3651,7 @@ export function installBridge(
     const open = [...bySession.values()]
     bySession.clear()
     bindings.clear()
+    bindingGenerations.clear()
     compositions.clear()
     callSnapshots.clear()
     runningBySession.clear()

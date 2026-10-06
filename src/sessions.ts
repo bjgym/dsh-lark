@@ -23,10 +23,29 @@
  * - **A pick is undone by picking.** This conversation's own derived session is
  *   always a row, so going back is the same gesture as going away — no second
  *   verb, nothing to remember.
+ * - **A card lives as long as the derivation behind it.** Its rows are
+ *   authorized by one reading of the corpus, so the first pick retires the card
+ *   rather than redrawing it with new buttons: a card that stayed pressable
+ *   would offer rows from a list the conversation may have outgrown. Going
+ *   somewhere else means asking for the list again.
+ * - **Nothing here opens a log it does not have to.** The host already folds
+ *   and checkpoints what a row shows, so the picker reads those rows and falls
+ *   back to the logs only where a deployment composes no such cache. That is
+ *   what lets the whole corpus be described — and therefore paged — instead of
+ *   a bounded window of it.
  * @module dsh-lark-channel/sessions
  */
 
-import type { HostEventRecord, HostSessionQuery, HostSessionRecord } from './host.ts'
+import type {
+  HostEventRecord,
+  HostProjectionBlock,
+  HostSession,
+  HostSessionProjectionCache,
+  HostSessionProjections,
+  HostSessionQuery,
+  HostSessionRecord,
+} from './host.ts'
+import { paginate, type Page } from './pager.ts'
 import type { ConversationSubject } from './session.ts'
 
 /** List the sessions this conversation may continue. Channel-owned: needs no agent. */
@@ -35,17 +54,39 @@ export const SESSIONS_COMMAND = 'sessions'
 /** Marks this plugin's session rows apart from other card actions. */
 export const SESSIONS_ACTION = 'dsh-lark-channel/sessions'
 
-/** How many rows the picker offers before it asks for a keyword instead. */
+/** How many session rows one page of the picker draws. */
+export const SESSIONS_PAGE_ROWS = 8
+
+/**
+ * The projection keys a row's cheap facts come from.
+ *
+ * All three are fixed-size state — a title, a dozen counters, two fields — so
+ * reading them for every candidate costs nothing beside opening one log. The
+ * one key whose state grows with the conversation is {@link RICH_KEY}, and that
+ * one is read only for the rows a card actually draws.
+ */
+const CHEAP_KEYS = ['title', 'sessionStats', 'sessionListMetadata'] as const
+
+/** The projection key whose state grows with the conversation: its turn outline. */
+const RICH_KEY = 'turnOutline'
+
+/**
+ * How many rows the picker offers before it asks for a keyword instead.
+ *
+ * The log rung's bound. Where a projection cache can label a row without
+ * opening its log, the list is paged instead and this does not apply.
+ */
 export const PICKER_ROWS = 5
 
 /**
  * How many candidates beyond the visible rows are described anyway.
  *
- * Describing costs a log read per session, so the window is bounded — but a
- * window exactly as wide as the card runs the card short whenever a candidate
- * turns out to be a session nothing ever happened in, and those are dropped
- * only after they have been read. A spare of zero leaves a card of eight empty
- * candidates with nothing to draw at all, which is why this cannot be zero.
+ * The log rung's spare. Describing costs a log read per session, so the window
+ * is bounded — but a window exactly as wide as the card runs the card short
+ * whenever a candidate turns out to be a session nothing ever happened in, and
+ * those are dropped only after they have been read. A spare of zero leaves a
+ * card of eight empty candidates with nothing to draw at all, which is why this
+ * cannot be zero.
  *
  * Kept no larger than it must be, because a read is not proportional to what
  * the row shows: every accessor on the query engine materializes the session's
@@ -60,12 +101,11 @@ export const PICKER_SPARE = 4
 /**
  * How many candidates a keyword is matched against by title.
  *
- * A title is a log read per session, so a keyword search over a corpus of
- * hundreds cannot read them all. Ordered newest-first, so what it does read is
- * the half of the corpus a person is plausibly looking for.
+ * The log rung's bound. A title is a log read per session, so a keyword search
+ * over a corpus of hundreds cannot read them all. Ordered newest-first, so what
+ * it does read is the half of the corpus a person is plausibly looking for.
  */
 export const SEARCH_MAX = 60
-
 
 /** One session a conversation may continue, as the picker shows it. */
 export interface SessionChoice {
@@ -91,7 +131,7 @@ export interface SessionChoice {
   readonly lastActive?: number | undefined
 }
 
-/** What one session's own log says about it, beyond its header. */
+/** What one session's own projections say about it, beyond its header. */
 export interface SessionFacts {
   /** Turns taken, which is the honest measure of how much is in there. */
   readonly turns: number
@@ -99,6 +139,122 @@ export interface SessionFacts {
   readonly lastActive?: number | undefined
   /** The last thing a PERSON said in it. */
   readonly lastSaid?: string | undefined
+  /** The host's folded title, absent when the log carries none. */
+  readonly title?: string | undefined
+  /** Whether nothing was ever said in it, as the host's own list judges it. */
+  readonly blank?: boolean | undefined
+}
+
+/**
+ * Where a row's facts come from, in the order the ladder tries them.
+ *
+ * The host folds every registered projection over every session log anyway and
+ * checkpoints the result durably, so the cheap rung costs no log read at all —
+ * which is what lets a card label the WHOLE corpus instead of a bounded window
+ * of it. The log rung is what a deployment composing no such cache has always
+ * had, and it stays because this plugin ships to deployments that compose less
+ * than the one it was written on.
+ */
+export interface FactSources {
+  /** The persisted projection rows, when the deployment composes them. */
+  readonly cache?: HostSessionProjectionCache | undefined
+  /** The live registry, which serves the same keys from a running session. */
+  readonly projections?: HostSessionProjections | undefined
+  /** The attached Session for one id, when this process already has one. */
+  readonly liveSession?: ((id: string) => HostSession | undefined) | undefined
+}
+
+/** One projection value as a record, or undefined when it is anything else. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
+/**
+ * Whether one listed header can witness a stored projection record.
+ *
+ * A record is bound to the format generation and the lineage that folded it, so
+ * a header that cannot name both cannot address one. Named separately from the
+ * read itself because the rung is decided for the whole corpus at once: one
+ * unaddressable record makes the list unpageable rather than half-pageable.
+ * @param header - the listed header.
+ * @returns true when a cache row could be bound to this lifecycle.
+ */
+export function cacheAddressable(header: HostSessionRecord['header']): boolean {
+  return typeof header?.id === 'string' && header.id !== ''
+    && typeof header.createdAt === 'number'
+    && typeof header.version === 'number'
+    && typeof header.isSeeded === 'boolean'
+}
+
+/**
+ * The projection rows that describe one listed session, without opening its log.
+ * @param sources - the cache faces to try.
+ * @param header - the listed header, which is the cache's identity witness.
+ * @param keys - the projection keys to read.
+ * @returns the block served, or undefined when no face can bind this lifecycle.
+ */
+export function projectedFacts(
+  sources: FactSources,
+  header: HostSessionRecord['header'],
+  keys: readonly string[],
+): HostProjectionBlock | undefined {
+  if (typeof header?.id !== 'string' || header.id === '') return undefined
+  // A running session's cells are the registry's own cut and trail the log by
+  // nothing; the stored rows trail it by the last checkpoint. Both are the same
+  // keys, so the newer face is simply asked first.
+  const live = sources.liveSession?.(header.id)
+  if (live !== undefined) {
+    const running = sources.projections?.cachedSnapshot?.(live, keys)
+    if (running !== undefined) return running
+  }
+  if (!cacheAddressable(header)) return undefined
+  return sources.cache?.cachedSnapshot({
+    id: header.id,
+    createdAt: header.createdAt as number,
+    ...header.cwd === undefined ? {} : { cwd: header.cwd },
+    version: header.version,
+    isSeeded: header.isSeeded,
+  }, keys)
+}
+
+/**
+ * The facts a cheap block carries: how much happened, when it last moved, what
+ * it is called, and whether anything was ever said in it.
+ * @param values - the served projection values, absent when nothing was served.
+ * @returns the facts the block answered; turns default to zero for the rest.
+ */
+function cheapFacts(values: Record<string, unknown> | undefined): SessionFacts {
+  const stats = asRecord(values?.sessionStats)
+  const metadata = asRecord(values?.sessionListMetadata)
+  const title = values?.title
+  const turns = typeof stats?.turns === 'number' ? stats.turns : 0
+  const lastPromptAt = typeof metadata?.lastPromptAt === 'number' ? metadata.lastPromptAt : undefined
+  return {
+    turns,
+    ...lastPromptAt === undefined ? {} : { lastActive: lastPromptAt },
+    ...typeof title === 'string' && title !== '' ? { title } : {},
+    ...typeof metadata?.blank === 'boolean' ? { blank: metadata.blank } : {},
+  }
+}
+
+/**
+ * The last thing a person said, as the turn outline recorded it.
+ *
+ * The outline keeps the FIRST human prompt of each turn and deliberately
+ * ignores later ones in the same turn, so a steer mid-turn does not relabel the
+ * conversation. That is the label a row wants: what the conversation has been
+ * about, not what was last typed into it.
+ * @param values - the served projection values, absent when nothing was served.
+ * @returns the label, clipped the way every other row label is.
+ */
+function outlineSaid(values: Record<string, unknown> | undefined): string | undefined {
+  const turns = asRecord(values?.turnOutline)?.turns
+  if (!Array.isArray(turns)) return undefined
+  const prompt = asRecord(turns.at(-1))?.prompt
+  if (typeof prompt !== 'string') return undefined
+  const said = prompt.replace(/\s+/g, ' ').trim()
+  if (said === '') return undefined
+  return said.length <= SAID_MAX_CHARS ? said : `${said.slice(0, SAID_MAX_CHARS)}…`
 }
 
 /** The event a turn opens with, counted as the size of a session. */
@@ -127,8 +283,12 @@ const SAID_MAX_CHARS = 40
 const SAID_MIN_CHARS = 4
 
 /**
- * Read what makes one session recognizable: how much has happened, when it
- * last moved, and the last thing a person said in it.
+ * Read what makes one session recognizable by opening its log.
+ *
+ * The log rung of the ladder, for a deployment composing no projection cache.
+ * Everything it computes is already folded and stored by the host wherever
+ * `sessionProjectionCache` is composed, which is why the picker prefers that
+ * face: the same answer for no read at all.
  *
  * The last human line, not the first and not the title. A title here is folded
  * from the session's FIRST prompt, so a chat that opened with "hello" is
@@ -187,20 +347,32 @@ export async function sessionFacts(
 /** Entry value marking "no pick"; a deep-merged patch cannot delete a key. */
 const NO_PICK = ''
 
-/** Card payload carried by one session row. */
+/** Card payload carried by one session row, or by a page control. */
 export interface SessionActionValue extends ConversationSubject {
   readonly kind: typeof SESSIONS_ACTION
-  /** The session to continue; the row for the derived one carries it too. */
-  readonly session: string
+  /**
+   * The rendering every control on this card carries.
+   *
+   * Shared by the rows and the page controls rather than minted per button: a
+   * card is retired by the first pick, so a second press anywhere on it has to
+   * be recognizable as that same card.
+   */
+  readonly a: string
+  /**
+   * The session to continue; the row for the derived one carries it too, and a
+   * page control carries none.
+   */
+  readonly session?: string | undefined
+  /** The page to draw; absent when the row itself is the subject. */
+  readonly page?: number | undefined
   /**
    * The workspace the row was offered under, when the card that carried it
    * named one.
    *
-   * Carried so a press can be authorized WITHOUT re-deriving the list. The
-   * derivation reads every candidate's whole log — one workspace here holds a
-   * 47 MB session — and the platform drops a card callback that does not answer
-   * in time, which the presser sees as a dead service rather than as the delay
-   * it is. The pick is still written against the conversation's live state.
+   * Carried so a press can be checked against the directory the CARD showed. A
+   * card outlives the conversation's directory: `/cd` moves it, and a press on
+   * the older card would otherwise continue a session from the workspace the
+   * chat has left — the exact sandbox move the picker filters against.
    */
   readonly workspace?: string | undefined
 }
@@ -214,14 +386,22 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
   if (typeof value !== 'object' || value === null) return undefined
   const record = value as Record<string, unknown>
   if (record.kind !== SESSIONS_ACTION) return undefined
-  if (typeof record.session !== 'string' || record.session === '') return undefined
+  if (typeof record.a !== 'string' || record.a === '') return undefined
+  if (record.session !== undefined && (typeof record.session !== 'string' || record.session === '')) return undefined
+  if (record.page !== undefined
+    && (typeof record.page !== 'number' || !Number.isSafeInteger(record.page) || record.page < 0)) return undefined
+  // A button that names neither is inert, and accepting it would authorize a
+  // press that can do nothing.
+  if (record.session === undefined && record.page === undefined) return undefined
   if (typeof record.key !== 'string' || record.key === '') return undefined
   if (typeof record.chatId !== 'string' || typeof record.chatType !== 'string') return undefined
   if (record.owner !== undefined && typeof record.owner !== 'string') return undefined
   if (record.workspace !== undefined && typeof record.workspace !== 'string') return undefined
   return {
     kind: SESSIONS_ACTION,
-    session: record.session,
+    a: record.a,
+    ...record.session === undefined ? {} : { session: record.session },
+    ...record.page === undefined ? {} : { page: record.page },
     key: record.key,
     chatId: record.chatId,
     chatType: record.chatType,
@@ -388,11 +568,55 @@ export interface SessionPickerInput {
 
 /** What the picker offers a conversation, and what it is leaving out. */
 export interface OfferedSessions {
-  /** Exactly the rows the card draws — and the only ids a press may name. */
+  /**
+   * Every session this conversation may continue, newest activity first.
+   *
+   * A press is authorized against exactly this list, whether or not the card is
+   * drawing the row it names — which is why a page is taken from here rather
+   * than derived per page.
+   */
   readonly rows: readonly SessionChoice[]
-  /** Older ones the card does not draw, so it can say how many. */
+  /** Older ones the card does not draw, so it can say how many. Zero when it pages. */
   readonly hidden: number
+  /**
+   * Whether {@link rows} is the WHOLE list, so a card may page through it.
+   *
+   * False where no projection cache can label a row without opening its log: the
+   * list is then the bounded window this picker has always read, and a page
+   * count computed from it would be a lie rather than a budget.
+   */
+  readonly complete: boolean
+  /**
+   * Fill in the one fact a cheap block cannot carry — what the conversation was
+   * last about — for the rows one page draws.
+   *
+   * A closure rather than a second pass over the corpus: the outline's state
+   * grows with the conversation, so it is read for the drawn rows only, and the
+   * derivation already holds the headers that address them. On the log rung the
+   * rows arrive described and this returns them unchanged.
+   * @param rows - the rows one page draws.
+   * @returns the same rows, labelled where the outline could label them.
+   */
+  readonly label: (rows: readonly SessionChoice[]) => readonly SessionChoice[]
 }
+
+/**
+ * The rows one page draws, and where it sits.
+ *
+ * A window that cannot be paged is always its own single page: its rows ARE the
+ * card, and the count it leaves out is reported as a number rather than as
+ * pages that would move every time a session was opened elsewhere.
+ * @param offered - the derivation.
+ * @param page - the requested zero-based page; out-of-range values clamp.
+ * @returns the rows to draw and the page's position.
+ */
+export function sessionsPage(offered: OfferedSessions, page: number): Page<SessionChoice> {
+  if (!offered.complete) return { rows: offered.rows, page: 0, pages: 1 }
+  return paginate(offered.rows, page, SESSIONS_PAGE_ROWS)
+}
+
+/** What a deployment composing nothing to list hands back: an empty, pageable list. */
+export const EMPTY_OFFER: OfferedSessions = { rows: [], hidden: 0, complete: true, label: drawn => drawn }
 
 /**
  * The sessions one conversation may continue, newest first.
@@ -553,6 +777,13 @@ export async function readTitles(
 export interface SessionOffer {
   /** The host's session-query engine. */
   readonly query: HostSessionQuery
+  /**
+   * Where a row's facts come from, when the deployment folds and stores them.
+   *
+   * Absent is not an error: the derivation falls back to opening logs, which is
+   * what this picker did before such a cache was ever asked for.
+   */
+  readonly sources?: FactSources | undefined
   /** The conversation the list is built for. */
   readonly scope: SessionPickerInput
   /** Resolves a path to its canonical form, so a symlinked workspace matches. */
@@ -573,24 +804,29 @@ export interface SessionOffer {
   readonly diagnose?: boolean | undefined
 }
 
+/** Newest activity first, falling back to creation for a session nothing moved. */
+function byRecency(left: SessionChoice, right: SessionChoice): number {
+  return (right.lastActive ?? right.createdAt ?? 0) - (left.lastActive ?? left.createdAt ?? 0)
+}
+
 /**
- * The sessions one conversation may continue right now, and how many more it
- * has that the card will not show.
+ * The sessions one conversation may continue right now.
  *
  * Derived on every call rather than remembered: sessions appear while a chat
  * is idle — the web UI opens one, `/new` leaves one behind — and a list built
- * once would offer yesterday's answer to today's press.
+ * once would offer yesterday's answer to today's press. That was worth caching
+ * only while every row cost a log read; it no longer is.
  *
- * What comes back IS what the card draws, and a press is authorized against
+ * What comes back IS what a press may name, and a press is authorized against
  * exactly this. One list, one boundary.
  * @param offer - the query, the conversation's scope, and how to canonicalize.
- * @returns the rows to offer, newest activity first, and the hidden count.
+ * @returns the rows to offer, newest activity first, and how to finish a page.
  */
 export async function offerSessions(offer: SessionOffer): Promise<OfferedSessions> {
   const { query, scope } = offer
   // Canonicalizing is a synchronous filesystem call, and a corpus of hundreds
   // of sessions holds a handful of distinct directories — so it is asked once
-  // per directory rather than once per record, twice over on a keyword.
+  // per directory rather than once per record.
   const canonicalized = new Map<string, string>()
   const canonical = (path: string): string => {
     const seen = canonicalized.get(path)
@@ -604,12 +840,103 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
     return [] as readonly HostSessionRecord[]
   })
   const keyword = scope.keyword?.trim() ?? ''
-  // Judged once, keeping each record's verdict: the choices are the same
-  // answer, and the withheld ones are what a short card has to be explained by.
-  const judged = judgeSessions(records, new Map(), scope, canonical)
+  // The rung is decided once, for the whole corpus: a record whose header cannot
+  // witness a stored row cannot be labelled without opening its log, and a list
+  // that is half cheap and half read cannot be paged honestly.
+  const sources = offer.sources
+  const folded = sources?.cache !== undefined && records.every(record => cacheAddressable(record.header))
   if (offer.diagnose === true) {
+    // Judged once, keeping each record's verdict: the choices are the same
+    // answer, and the withheld ones are what a short card has to be explained by.
+    const judged = judgeSessions(records, new Map(), scope, canonical)
     for (const line of accountFor(records, judged, scope, canonical)) offer.report?.(line)
   }
+  if (folded && sources !== undefined) return offerFromProjections(offer, sources, records, keyword, canonical)
+  return await offerFromLogs(offer, records, keyword, canonical)
+}
+
+/**
+ * The picker's answer where the host already folded what a row shows.
+ *
+ * No log is opened, so every candidate can be described rather than a bounded
+ * window of them — which is what makes the list pageable and what retires the
+ * "older ones" count entirely.
+ * @param offer - the derivation.
+ * @param sources - the cache faces the cheap and rich keys are read from.
+ * @param records - the host's corpus listing.
+ * @param keyword - the trimmed filter, empty when none was given.
+ * @param canonical - resolves one path to its canonical form.
+ * @returns every eligible row, and how to label one page of them.
+ */
+function offerFromProjections(
+  offer: SessionOffer,
+  sources: FactSources,
+  records: readonly HostSessionRecord[],
+  keyword: string,
+  canonical: (path: string) => string,
+): OfferedSessions {
+  const headers = new Map<string, HostSessionRecord['header']>()
+  const facts = new Map<string, SessionFacts>()
+  const titles = new Map<string, string>()
+  for (const record of records) {
+    const id = record.header?.id
+    if (typeof id !== 'string' || id === '') continue
+    const cheap = cheapFacts(projectedFacts(sources, record.header, CHEAP_KEYS)?.values)
+    headers.set(id, record.header)
+    facts.set(id, cheap)
+    if (cheap.title !== undefined) titles.set(id, cheap.title)
+  }
+  const candidates = sessionChoices(records, titles, { ...offer.scope, keyword: '' }, canonical)
+  const shortlist = sessionChoices(records, titles, offer.scope, canonical)
+    // A session nothing ever happened in is not a conversation to continue —
+    // except this one's own, which is how a picked conversation comes back.
+    // Where the host served no row at all the answer is unknown, and an unknown
+    // row stays visible: hiding it would drop the sessions this deployment has
+    // simply not checkpointed yet.
+    .filter(choice => choice.own || facts.get(choice.id)?.blank !== true)
+    .map((choice) => {
+      const known = facts.get(choice.id)
+      return known === undefined ? choice : { ...choice, ...known }
+    })
+  shortlist.sort(byRecency)
+  if (offer.diagnose === true) {
+    const pages = Math.max(1, Math.ceil(shortlist.length / SESSIONS_PAGE_ROWS))
+    offer.report?.(`lark-channel: session picker: folded records=${records.length}`
+      + ` candidates=${candidates.length}`
+      + `${keyword === '' ? '' : ` (keyword="${keyword}")`}`
+      + ` offered=${shortlist.length} pages=${pages}`)
+  }
+  return {
+    rows: shortlist,
+    hidden: 0,
+    complete: true,
+    label: drawn => drawn.map((choice) => {
+      const said = outlineSaid(projectedFacts(sources, headers.get(choice.id), [RICH_KEY])?.values)
+      return said === undefined ? choice : { ...choice, lastSaid: said }
+    }),
+  }
+}
+
+/**
+ * The picker's answer where no projection cache can label a row.
+ *
+ * Unchanged from what this picker has always done: a bounded window described
+ * from the logs themselves, and a count of the older ones it left out. It is
+ * not paged, because a page count derived from a bounded window would move
+ * every time a session was opened on another surface.
+ * @param offer - the derivation.
+ * @param records - the host's corpus listing.
+ * @param keyword - the trimmed filter, empty when none was given.
+ * @param canonical - resolves one path to its canonical form.
+ * @returns the rows to draw, the hidden count, and identity labelling.
+ */
+async function offerFromLogs(
+  offer: SessionOffer,
+  records: readonly HostSessionRecord[],
+  keyword: string,
+  canonical: (path: string) => string,
+): Promise<OfferedSessions> {
+  const { query, scope } = offer
   const candidates = sessionChoices(records, new Map(), { ...scope, keyword: '' }, canonical)
   // A keyword is matched against titles, so the titles have to exist before the
   // filter runs — the reason a keyword used to match nothing but ids. Bounded,
@@ -657,8 +984,7 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
   // Ordered by the timestamp the row prints. The shortlist could only be cut by
   // creation time, which is what a header knows without opening a log; now that
   // these rows have been read, "3 天前" must not sit above "40 分钟前".
-  kept.sort((left, right) =>
-    (right.lastActive ?? right.createdAt ?? 0) - (left.lastActive ?? left.createdAt ?? 0))
+  kept.sort(byRecency)
   const top = kept.slice(0, PICKER_ROWS)
   // "You are here" is not something the card may run out of room for: a
   // conversation sitting on a session it has not spoken in lately would
@@ -682,7 +1008,12 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
       offer.report?.(line)
     }
   }
-  return { rows, hidden: kept.length - rows.length + (shortlist.length - window.length) }
+  return {
+    rows,
+    hidden: kept.length - rows.length + (shortlist.length - window.length),
+    complete: false,
+    label: drawn => drawn,
+  }
 }
 
 /**

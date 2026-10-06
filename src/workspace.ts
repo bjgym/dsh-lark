@@ -19,6 +19,7 @@ import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, resolve, sep } from 'node:path'
 import { epochSessionId } from './epoch.ts'
+import { paginate, type Page } from './pager.ts'
 import type { ConversationSubject } from './session.ts'
 import { sessionIdFor } from './session.ts'
 
@@ -353,15 +354,13 @@ export function workspaceChoices(store: ChatWorkspaces, key: string): WorkspaceC
   return [...rows.filter(row => row.current), ...rows.filter(row => !row.current)]
 }
 
-/** One page of workspace rows, and where it sits in the whole list. */
-export interface WorkspacePage {
-  /** The rows this page draws, at most {@link WS_PAGE_ROWS}. */
-  readonly rows: readonly WorkspaceChoice[]
-  /** Zero-based page index, clamped into range. */
-  readonly page: number
-  /** Total pages, never zero — an empty list is still one page. */
-  readonly pages: number
-}
+/**
+ * One page of workspace rows, and where it sits in the whole list.
+ *
+ * The rows, the page index, and the page count are {@link Page}'s; this name
+ * says which list they came from.
+ */
+export type WorkspacePage = Page<WorkspaceChoice>
 
 /**
  * The slice of rows one page shows.
@@ -375,22 +374,7 @@ export interface WorkspacePage {
  * @returns the rows to draw and the page's position.
  */
 export function workspacePage(choices: readonly WorkspaceChoice[], page: number): WorkspacePage {
-  const pinned = choices.filter(choice => choice.current)
-  const rest = choices.filter(choice => !choice.current)
-  // The pinned row occupies a slot on the FIRST page only. Reserving its slot on
-  // every page would draw the same directory twice — two buttons for one
-  // destination — and would shrink pages that do not carry it.
-  const capacity = Math.max(1, WS_PAGE_ROWS - pinned.length)
-  // The first page holds the pinned row plus `capacity` others; every later page
-  // holds `WS_PAGE_ROWS`. Counting the first page as a full `capacity` of `rest`
-  // is what makes the pages partition the list exactly once.
-  const afterFirst = Math.max(0, rest.length - capacity)
-  const pages = Math.max(1, 1 + Math.ceil(afterFirst / WS_PAGE_ROWS))
-  const index = Math.min(Math.max(0, Math.trunc(page)), pages - 1)
-  const rows = index === 0
-    ? [...pinned, ...rest.slice(0, capacity)]
-    : rest.slice(capacity + (index - 1) * WS_PAGE_ROWS, capacity + index * WS_PAGE_ROWS)
-  return { rows, page: index, pages }
+  return paginate(choices, page, WS_PAGE_ROWS)
 }
 
 /** Card payload carried by one workspace row, or by a page control. */

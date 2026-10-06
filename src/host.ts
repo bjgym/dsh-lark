@@ -107,6 +107,17 @@ export interface HostSessionRecord {
     readonly delegationDepth?: number
     /** The session this one was forked from, when it was forked at all. */
     readonly parentSession?: string
+    /**
+     * The Session format generation this log was written in.
+     *
+     * A projection-cache record is bound to the generation that folded it, so a
+     * header that cannot name one cannot witness a cache row either. Absent on a
+     * listing older than the field, which reads as "no cache read" rather than as
+     * a wrong one.
+     */
+    readonly version?: number
+    /** Whether the log carries a fork-inherited prefix; the cache binds to it. */
+    readonly isSeeded?: boolean
   }
   /** Whether an agent currently drives this id. */
   readonly live?: boolean
@@ -467,6 +478,42 @@ export interface HostSettings {
   register(ns: string, schema: unknown, options?: { base?: unknown }): HostSettingsScope
 }
 
+/** One projection block, as either cache face serves it. */
+export interface HostProjectionBlock {
+  /** The log position the served values have folded through at least. */
+  readonly asOfSeq: number
+  /** Whole values per projection key; a key with no usable row is absent. */
+  readonly values: Record<string, unknown>
+}
+
+/**
+ * The `sessionProjectionCache` service (subset).
+ *
+ * The host folds every registered projection over each session log anyway, and
+ * checkpoints the result durably. Reading those rows back is the one way to
+ * label a session without opening its log at all: the values are as stale as
+ * the last checkpoint and never wrong, which is the same bargain the host's own
+ * session list makes.
+ */
+export interface HostSessionProjectionCache {
+  /**
+   * The stored rows bound to one listed header's lifecycle.
+   * @param meta - the listed header; its format generation and lineage are the identity witness.
+   * @param keys - the projection keys the caller needs.
+   * @returns the block, or undefined when no usable row exists for this lifecycle.
+   */
+  cachedSnapshot(
+    meta: {
+      readonly id: string
+      readonly createdAt: number
+      readonly cwd?: string | undefined
+      readonly version?: number | undefined
+      readonly isSeeded?: boolean | undefined
+    },
+    keys?: readonly string[],
+  ): HostProjectionBlock | undefined
+}
+
 /**
  * The `sessionProjections` registry, narrowed to reading one session's cut.
  *
@@ -482,6 +529,16 @@ export interface HostSessionProjections {
    * @returns the cut, keyed by projection, and the log position it answers for.
    */
   snapshot(session: HostSession): { readonly asOfSeq: number; readonly values: Record<string, unknown> }
+  /**
+   * Read only the cells this registry already materialized for one session,
+   * without folding history: the live face of the same rows the persisted cache
+   * serves to a listing. Optional because a deployment may compose a registry
+   * older than this read; a row then falls back to the stored rows or to the log.
+   * @param session - the attached session whose cached cells are inspected.
+   * @param keys - the projection keys the caller needs.
+   * @returns the lowest common cached cut, or undefined when no cell exists.
+   */
+  cachedSnapshot?(session: HostSession, keys?: readonly string[]): HostProjectionBlock | undefined
 }
 
 /** Whole-session token totals, as the host's `tokenUsage` projection reports them. */

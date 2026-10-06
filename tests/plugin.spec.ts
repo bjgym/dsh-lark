@@ -3502,7 +3502,7 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('reuses the card\'s own derivation for a press, and repaints from it', async () => {
+    it('derives once per press, and repaints from that same derivation', async () => {
       const { query, listed } = createFakeSessionQuery([
         {
           id: 'session-web-ui',
@@ -3519,13 +3519,12 @@ describe('dsh-lark-channel', () => {
 
       await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
 
-      // NO derivation at all: the press reuses the list its own card was drawn
-      // from, which still describes this conversation. A derivation re-reads
-      // every session header — 233 of them behind zstd here, measured near
-      // three seconds — and a card callback that overruns its budget is dropped
-      // by the platform as an unanswered press. The repaint still comes from
-      // that same list, and the row it marks current is read fresh.
-      expect(listed.length - before).toBe(0)
+      // EXACTLY ONE derivation, and it is a fresh one. The press re-reads the
+      // corpus rather than trusting the card it was drawn on: a card outlives
+      // the list behind it, and what a press may name is only ever a row the
+      // conversation would be offered NOW. The repaint then reuses that same
+      // derivation, so the reading is not paid twice.
+      expect(listed.length - before).toBe(1)
       const repaintable = (harness.fake.updated.at(-1) as { card?: object } | undefined)?.card
         ?? (harness.fake.sent.at(-1)!.input as { card: object }).card
       expect(cardControls(repaintable).length).toBeGreaterThan(0)
@@ -3688,7 +3687,7 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('goes back by pressing the conversation\'s own session', async () => {
+    it('goes back by asking for the list again and pressing its own session', async () => {
       const { query } = createFakeSessionQuery([
         {
           id: 'session-web-ui',
@@ -3709,15 +3708,19 @@ describe('dsh-lark-channel', () => {
       const first = (harness.fake.sent.at(-1)!.input as { card: object }).card
       const away = cardControls(first)
         .find((control) => (control.value as { session: string }).session === 'session-web-ui')!
-      await harness.fake.emitCardAction(clickAction(away.value))
+      expect(await harness.fake.emitCardAction(clickAction(away.value))).toMatchObject({ toast: { type: 'success' } })
 
-      // The repainted card offers the derived session, and pressing it is the
-      // whole of "go back" — there is no second verb to remember.
-      const painted = (await harness.fake.emitCardAction(clickAction(away.value))) as { card?: { data: object } }
-      const rows = cardControls(painted.card!.data)
-      const home = rows.find((control) => (control.value as { session: string }).session === 'lark-oc_chat_1')!
-      const response = await harness.fake.emitCardAction(clickAction(home.value))
-      expect(response).toMatchObject({ toast: { type: 'success' } })
+      // That pick spent the card: a second press on it is refused rather than
+      // honored against a list the conversation has already moved on from.
+      expect(await harness.fake.emitCardAction(clickAction(away.value))).toMatchObject({ toast: { type: 'info' } })
+
+      // Going back is therefore a fresh list — one message, then one press.
+      await harness.fake.emitMessage(fakeMessage({ content: '/sessions' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(1) })
+      const second = (harness.fake.sent.at(-1)!.input as { card: object }).card
+      const home = cardControls(second)
+        .find((control) => (control.value as { session: string }).session === 'lark-oc_chat_1')!
+      expect(await harness.fake.emitCardAction(clickAction(home.value))).toMatchObject({ toast: { type: 'success' } })
 
       await harness.fake.emitMessage(fakeMessage({ content: 'back' }))
       await vi.waitFor(() => { expect(harness.agents.created.at(-1)!.sessionId).toBe('lark-oc_chat_1') })
@@ -3731,6 +3734,7 @@ describe('dsh-lark-channel', () => {
       const harness = await mountChannel({}, { sessionQuery: query })
       const stale = {
         kind: 'dsh-lark-channel/sessions',
+        a: 'a-card-drawn-before-the-session-went-away',
         session: 'session-from-another-workspace',
         key: 'oc_chat_1',
         chatId: 'oc_chat_1',
