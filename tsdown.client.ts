@@ -107,7 +107,12 @@ function cssModulesPlugin(): TsdownPlugin {
         minify: true,
       })
       const classMap: Record<string, string> = {}
-      for (const [local, exported] of Object.entries(exports ?? {})) classMap[local] = exported.name
+      // Sorted by code unit, because lightningcss returns this map in an
+      // unspecified order: an artifact whose bytes change from run to run cannot
+      // be compared, cached, or reproduced from a published tarball. The emitted
+      // class names are unaffected — only the order they are listed in.
+      const order = Object.entries(exports ?? {}).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      for (const [local, exported] of order) classMap[local] = exported.name
       return styleInjectionModule(CLIENT_ID, fileId, code.toString(), classMap)
     },
   }

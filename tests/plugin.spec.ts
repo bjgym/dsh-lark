@@ -1,5 +1,5 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
-import { chmod, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -34,6 +34,7 @@ import {
   SENDER_ID,
 } from './harness.ts'
 import type { CreatedAgent } from './harness.ts'
+import { denyRead, READ_DENIED_CODE } from './platform.ts'
 
 /** Directories these tests let the channel write into, removed after each one. */
 const workspaces: string[] = []
@@ -1257,12 +1258,12 @@ describe('dsh-lark-channel', () => {
         const { created, tool } = await boundSender(harness)
         // Clears the containment check and the ceiling, then fails in the read —
         // where the message Node builds quotes the absolute path it was given.
-        await chmod(join(workspace, 'report.md'), 0o000)
+        denyRead(join(workspace, 'report.md'))
 
         const failure = await tool.execute({ path: 'report.md' }, { agent: created.agent })
           .then(() => undefined, (error: unknown) => error)
 
-        expect(String(failure)).toContain('EACCES')
+        expect(String(failure)).toContain(READ_DENIED_CODE)
         // The model typed `report.md`; a failure branch that answered with the
         // canonical path would hand whoever wrote the files it reads a map of the
         // filesystem — which is exactly what every refusal here declines to do.
@@ -2634,7 +2635,9 @@ describe('dsh-lark-channel', () => {
       // /ws lists both directories and marks the current one.
       await harness.fake.emitMessage(fakeMessage({ content: '/ws' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('工作区') })
-      expect(sentText(harness)).toContain(target)
+      // Searched in the spelling `sentText` actually holds, which is JSON: a
+      // Windows separator arrives escaped there, so the raw path never matches.
+      expect(sentText(harness)).toContain(JSON.stringify(target).slice(1, -1))
 
       // /cd back to the default records the explicit marker and re-derives the plain id.
       const defaultPath = realpathSync(process.cwd())
