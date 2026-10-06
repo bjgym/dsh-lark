@@ -17,7 +17,8 @@
 import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, resolve } from 'node:path'
+import { isSamePath, isWithinContainer } from './containment.ts'
 import { epochSessionId } from './epoch.ts'
 import { paginate, type Page } from './pager.ts'
 import type { ConversationSubject } from './session.ts'
@@ -72,14 +73,20 @@ export function expandHome(input: string, home = homedir()): string {
  * These are the directories a `/cd` typo or a lazy shortcut lands on — and an
  * agent whose sandbox writes "the workspace" must not have that be the
  * filesystem root or someone's entire home.
+ *
+ * Every comparison here goes through the filesystem's own rules rather than
+ * `===`, because these guards only work if they fire: on a case-folding host,
+ * `c:\users\me` IS the home that `C:\Users\me` names, and a string comparison
+ * would answer "a directory somewhere else" and let a chat point its agent at
+ * the whole thing.
  * @param canonical - the canonicalized candidate.
  * @param home - the home directory, canonicalized by the caller's probe.
  * @returns the refusal, or undefined when the directory is specific enough.
  */
 export function forbiddenReason(canonical: string, home = homedir()): string | undefined {
-  if (dirname(canonical) === canonical) return '不能把文件系统根目录设为工作区'
-  if (canonical === home) return '不能把 Home 根目录设为工作区，请选更具体的子目录'
-  if (canonical === dirname(home)) return '不能把用户目录的父级设为工作区'
+  if (isSamePath(dirname(canonical), canonical)) return '不能把文件系统根目录设为工作区'
+  if (isSamePath(canonical, home)) return '不能把 Home 根目录设为工作区，请选更具体的子目录'
+  if (isSamePath(canonical, dirname(home))) return '不能把用户目录的父级设为工作区'
   return undefined
 }
 
@@ -87,16 +94,24 @@ export function forbiddenReason(canonical: string, home = homedir()): string | u
  * Whether a path falls under one of the configured roots. An empty list allows
  * anywhere: the platform already decides who can reach the bot, and this knob
  * only narrows what those people may point it at.
+ *
+ * Both sides are compared the way the filesystem compares them, so a root
+ * spelled in another case is the same allow-list entry wherever the host folds
+ * case — an operator who wrote `c:\work` has not thereby forbidden their own
+ * `C:\work`.
+ *
+ * The root is resolved first, so a root spelled relative keeps the meaning it
+ * always had. The candidate is deliberately NOT resolved for it: it is already
+ * canonical by contract, and a spelling that never named a place must be
+ * refused here rather than quietly given the process working directory's
+ * meaning.
  * @param path - canonical candidate directory.
  * @param roots - allowed directory prefixes.
  * @returns true when allowed.
  */
 export function withinRoots(path: string, roots: readonly string[]): boolean {
   if (roots.length === 0) return true
-  return roots.some((root) => {
-    const resolved = resolve(root)
-    return path === resolved || path.startsWith(resolved.endsWith(sep) ? resolved : `${resolved}${sep}`)
-  })
+  return roots.some((root) => isWithinContainer(path, resolve(root)))
 }
 
 /**

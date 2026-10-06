@@ -84,6 +84,13 @@ describe('withinRoots', () => {
     expect(withinRoots('/srv/alphabet', ['/srv/alpha'])).toBe(false)
     expect(withinRoots('/other', ['/srv/alpha', '/srv/beta'])).toBe(false)
   })
+
+  it('reads a root the way the host filesystem reads it', () => {
+    // An operator who typed their root in another case has not forbidden the
+    // directory they meant — on Windows that spelling IS the directory, and on
+    // a POSIX host it is a different one that the list never allowed.
+    expect(withinRoots('/srv/alpha/sub', ['/srv/ALPHA'])).toBe(process.platform === 'win32')
+  })
 })
 
 describe('forbiddenReason', () => {
@@ -92,6 +99,22 @@ describe('forbiddenReason', () => {
     expect(forbiddenReason('/home/me', '/home/me')).toContain('Home')
     expect(forbiddenReason('/home', '/home/me')).toContain('父级')
     expect(forbiddenReason('/home/me/work', '/home/me')).toBeUndefined()
+  })
+
+  it('cannot be spelled around with case on a case-folding filesystem', () => {
+    // These two guards only work if they fire, and the thing they refuse is
+    // someone's entire home. A comparison that asks the string instead of the
+    // filesystem answers "a directory somewhere else" and lets it through.
+    const home = forbiddenReason('/home/ME', '/home/me')
+    const parent = forbiddenReason('/HOME', '/home/me')
+    if (process.platform === 'win32') {
+      expect(home).toContain('Home')
+      expect(parent).toContain('父级')
+    } else {
+      // Two genuinely unrelated directories, which the guard must not refuse.
+      expect(home).toBeUndefined()
+      expect(parent).toBeUndefined()
+    }
   })
 })
 
