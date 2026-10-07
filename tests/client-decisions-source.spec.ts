@@ -64,7 +64,7 @@ describe('SettledApprovalsRegistry', () => {
     const registry = new SettledApprovalsRegistry(sessionsFace(() => bindingOver(source)))
     const read = registry.sourceFor(SESSION)
     read.subscribe(() => {})
-    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
   })
 
   it('starts empty and attaches once the conversation materializes', () => {
@@ -79,7 +79,7 @@ describe('SettledApprovalsRegistry', () => {
     expect(read.getSnapshot()).toEqual([])
     live = bindingOver(source)
     const dispose = read.subscribe(() => {})
-    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
     dispose()
   })
 
@@ -104,7 +104,7 @@ describe('SettledApprovalsRegistry', () => {
 
     expect(retired.subscriberCount).toBe(0)
     expect(replacement.subscriberCount).toBe(1)
-    expect(read.getSnapshot()).toEqual([{ id: 'b', toolName: 'pwsh' }])
+    expect(read.getSnapshot()).toEqual([{ id: 'b', toolName: 'pwsh', outcome: 'allowed-once' }])
   })
 
   it('clears a stale fold when the replacement reports nothing', () => {
@@ -117,7 +117,7 @@ describe('SettledApprovalsRegistry', () => {
     const registry = new SettledApprovalsRegistry(sessionsFace(() => live))
     const read = registry.sourceFor(SESSION)
     read.subscribe(() => {})
-    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
 
     live = bindingOver(replacement)
     const seen = vi.fn()
@@ -140,7 +140,7 @@ describe('SettledApprovalsRegistry', () => {
     const registry = new SettledApprovalsRegistry(sessionsFace(() => live))
     const read = registry.sourceFor(SESSION)
     read.subscribe(() => {})
-    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
 
     live = bindingOver(replacement)
     read.markAnsweredHere('b')
@@ -157,7 +157,9 @@ describe('SettledApprovalsRegistry', () => {
     expect(read.getSnapshot()).toEqual([])
     source.push(entry({ type: 'approval/decided', data: { id: 'a', outcome: 'rejected' } }))
     expect(seen).toHaveBeenCalled()
-    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+    // The recorded decision rides along, so closing this browser's copy submits
+    // what was actually decided.
+    expect(read.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', outcome: 'rejected' }])
   })
 
   it('retires a request this browser answered itself', () => {

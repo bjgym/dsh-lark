@@ -714,7 +714,12 @@ export async function mountChannel(
   config: ConfigOverrides = {},
   services: {
     defaultModel?: HostDefaultModel
-    settings?: HostSettings
+    /**
+     * The `settings` service. Typed as an object rather than as the modern
+     * face: the seam moved between host generations, the binding detects which
+     * members a deployment composed, and a test may compose either one.
+     */
+    settings?: object
     registerApp?: RegisterAppPort
     presets?: HostAgentPresets
     /**
@@ -969,7 +974,7 @@ export function createFakeCommands(
   const executed: string[] = []
   const service: HostCommands = {
     list: () => available,
-    async execute(_agent, line, _signal) {
+    async execute(_agent, line, _submittedAttachments, _signal) {
       executed.push(line)
       const name = commandName(line) ?? ''
       if (!available.some(c => c.name === name)) return undefined
@@ -995,23 +1000,57 @@ export function createFakeTools(
   return { service, views }
 }
 
-/** An in-memory `settings` service: one namespace layering base under `stored`. */
-export function createFakeSettings(stored: Record<string, unknown> = {}) {
+/**
+ * An in-memory `settings` service.
+ *
+ * It answers BOTH host generations, because a deployment may run either: the
+ * modern surface (`describe`/`update`/`replace`, keyed by the row's own id) and
+ * the older one (`register` → a namespace scope). `updates` records every patch
+ * whichever seam carried it, so a test can assert what was persisted without
+ * caring which generation the plugin chose; `written` names the row the modern
+ * seam wrote to, and `registered` the namespace the older one registered.
+ *
+ * `legacy: true` composes the older seam ALONE, for the tests that pin what this
+ * plugin does on a deployment that only offers it — there, a stored document is
+ * layered under the entry config by the registration, which is what those cases
+ * are about.
+ * @param stored - the document the older seam layers under its base.
+ * @param options - `legacy` to compose the older seam alone.
+ */
+export function createFakeSettings(
+  stored: Record<string, unknown> = {},
+  options: { legacy?: boolean } = {},
+) {
   const updates: object[] = []
   const registered: { ns: string; base: unknown }[] = []
-  const settings: HostSettings = {
-    register(ns, _schema, options) {
-      registered.push({ ns, base: options?.base })
+  const written: { ns: string; patch: object }[] = []
+  const legacy = {
+    register(ns: string, _schema: unknown, opts?: { base?: unknown }) {
+      registered.push({ ns, base: opts?.base })
       return {
-        get: () => ({ ...(options?.base as Record<string, unknown>), ...stored }),
-        update: async (patch) => {
+        get: () => ({ ...(opts?.base as Record<string, unknown>), ...stored }),
+        update: async (patch: object) => {
           updates.push(patch)
           Object.assign(stored, patch)
         },
       }
     },
   }
-  return { settings, updates, registered }
+  const modern: HostSettings = {
+    describe: () => [],
+    async update(ns: string, patch: object) {
+      written.push({ ns, patch })
+      updates.push(patch)
+      Object.assign(stored, patch)
+    },
+    async replace(ns: string, section: object) {
+      written.push({ ns, patch: section })
+      updates.push(section)
+      Object.assign(stored, section)
+    },
+  }
+  const settings = options.legacy === true ? legacy : { ...modern, ...legacy }
+  return { settings, updates, registered, written }
 }
 
 /** One node of a card, as the tests need to see it. */

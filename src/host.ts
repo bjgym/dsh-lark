@@ -331,8 +331,19 @@ export interface HostCommands {
    * Run one complete slash-command line. Resolves `undefined` when the syntax
    * or the name does not resolve, which is what distinguishes an unknown
    * command from one that ran and failed.
+   * @param agent - the agent whose session the command runs against.
+   * @param line - the complete line, slash included.
+   * @param submittedAttachments - images and staged file receipts the
+   * submission carried, in order; empty for a plain invocation, which is the
+   * only kind this channel submits.
+   * @param signal - cancellation for the execution.
    */
-  execute(agent: HostAgent, line: string, signal: AbortSignal): Promise<HostCommandExecution | undefined>
+  execute(
+    agent: HostAgent,
+    line: string,
+    submittedAttachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<HostCommandExecution | undefined>
 }
 
 /** The `systemPrompt` assembler, as this plugin's per-agent composition uses it. */
@@ -461,21 +472,38 @@ export interface HostLoader {
   await(): Promise<unknown>
 }
 
-/** One registered namespace's owner scope (subset of the host `SettingsScope`). */
-export interface HostSettingsScope {
-  /** The resolved value: schema defaults, then composition base, then the user document. */
-  get(): unknown
-  /** Deep-merge a patch into the user section and persist it through the provider. */
-  update(patch: object): Promise<unknown>
+/**
+ * One Loader row's live settings, as the host's `describe()` publishes it.
+ *
+ * The namespace is the row's own `id:` in the profile's configuration tree, and
+ * `value` is that row's effective config projected onto the fields its schema
+ * marks volatile. A row with no volatile field is absent from the list.
+ */
+export interface HostSettingsDescriptor {
+  /** The row's configuration-tree id, which is the namespace every write names. */
+  readonly ns: string
+  /** The row's effective config, volatile fields only. */
+  readonly value?: unknown
+  /** Monotonic revision, for a caller that wants to fence its write. */
+  readonly revision?: number
 }
 
-/** The `settings` user-settings service (subset of `SettingsProvider`). */
+/**
+ * The `settings` service (subset of the host `SettingsForms`).
+ *
+ * Writes go to the PROFILE's patch document and only touch fields the row's own
+ * schema marks volatile; the host refuses anything else. This channel therefore
+ * keeps its managed state on those fields, and a deployment whose row declares
+ * none gets an in-memory channel with one line saying so (see
+ * `settings-store.ts`).
+ */
 export interface HostSettings {
-  /**
-   * Register a namespace schema; the registration is an effect on the calling
-   * fiber. Duplicate namespaces and stored sections the schema rejects fail loud.
-   */
-  register(ns: string, schema: unknown, options?: { base?: unknown }): HostSettingsScope
+  /** Every configurable row's live volatile config, in tree order. */
+  describe(options?: unknown): readonly HostSettingsDescriptor[]
+  /** Deep-merge one patch into a row's section and persist it. */
+  update(ns: string, patch: object, expectedRevision?: number): Promise<void>
+  /** Replace a row's section outright, keeping the inherited base underneath. */
+  replace(ns: string, section: object, expectedRevision?: number): Promise<void>
 }
 
 /** One projection block, as either cache face serves it. */

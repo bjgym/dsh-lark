@@ -12,6 +12,7 @@ import { installBridge, type ChannelPort } from './bridge.ts'
 import { migrateAppSecret, resolveAppSecret, storeAppSecret } from './credentials.ts'
 import type { HostCredentials } from './credentials.ts'
 import { instanceIdentity } from './instance.ts'
+import { createSettingsBinding, entryIdOf } from './settings-store.ts'
 import type { CotEvent, CotHandle } from './cot.ts'
 import type { PanelCommand } from './slash-panel.ts'
 import { beginOnboarding } from './onboarding.ts'
@@ -226,33 +227,33 @@ export function apply(ctx: Context, config: Config): void {
     let persist = async (_app: OnboardedApp): Promise<boolean> => false
     const credentials = ctx.get('credentials') as HostCredentials | undefined
     const settings = ctx.get('settings') as HostSettings | undefined
-    if (settings !== undefined) {
-      try {
-        const scope = settings.register(identity.settingsNamespace, Config, { base: config })
-        resolved = resolveConfig(scope.get() as Config)
-        persistState = async (patch) => {
-          await scope.update(patch)
-          return true
-        }
-        // Onboarding hands the secret to the credentials seam and records only
-        // the reference, so the settings document never learns it.
-        persist = async (app) => {
-          const stored = await internals.storeSecret(credentials, app.appSecret, internals.notify, identity.secretRef)
-          return persistState({
-            ...app,
-            ...stored.ref === undefined ? {} : { appSecretRef: stored.ref },
-            // Blanked rather than omitted: the patch deep-merges, so a key is
-            // overwritten and never removed, and an empty secret is an absent
-            // one everywhere here.
-            ...stored.inSettings ? {} : { appSecret: '' },
-          })
-        }
-      } catch (error) {
-        ctx.logger.error(
-          'settings registration failed; continuing with entry config only: %s',
-          error instanceof Error ? error.message : error,
-        )
-      }
+    // The settings seam moved between host generations: the modern one writes a
+    // row's volatile config by the row's own id, the older one registered a
+    // namespace and handed back a scope. The binding picks whichever this
+    // deployment composed and says so once when it can use neither, instead of
+    // leaving managed state silently in memory.
+    const binding = createSettingsBinding({
+      settings,
+      entryId: entryIdOf(ctx) ?? identity.settingsNamespace,
+      namespace: identity.settingsNamespace,
+      schema: Config,
+      base: config,
+      report: internals.notify,
+    })
+    if (binding.resolved !== undefined) resolved = resolveConfig(binding.resolved as Config)
+    persistState = binding.persist
+    // Onboarding hands the secret to the credentials seam and records only the
+    // reference, so the settings document never learns it.
+    persist = async (app) => {
+      const stored = await internals.storeSecret(credentials, app.appSecret, internals.notify, identity.secretRef)
+      return persistState({
+        ...app,
+        ...stored.ref === undefined ? {} : { appSecretRef: stored.ref },
+        // Blanked rather than omitted: the patch deep-merges, so a key is
+        // overwritten and never removed, and an empty secret is an absent one
+        // everywhere here.
+        ...stored.inSettings ? {} : { appSecret: '' },
+      })
     }
 
     // A secret already sitting in the settings document moves behind a

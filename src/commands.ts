@@ -110,7 +110,9 @@ export async function runCommandLine(
   if (commands === undefined) {
     return { reply: `⚠️ 本部署没有组合命令运行时，\`/${name}\` 无法执行。`, resolved: false }
   }
-  const execution = await commands.execute(agent, trimmed, signal)
+  // The host's `execute` takes the submission's attachments between the line and
+  // the signal; a chat's own command carries none, but the array has to be there.
+  const execution = await commands.execute(agent, trimmed, [], signal)
   if (execution === undefined) {
     return { reply: `⚠️ 未知命令 \`/${name}\`。\n\n${helpText(commands, agent)}`, resolved: false }
   }

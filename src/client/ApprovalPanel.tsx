@@ -80,13 +80,24 @@ export function ApprovalPanel(props: LarkApprovalPanelProps & InjectFace<LarkApp
   const { displayReason, reason: plainReason } = props.matched
   const reason = displayReason === undefined ? plainReason : props.resolveReason(displayReason)
   const settledHere = settledForTarget(settled, props.matched)
+  // Latched, never derived. Retiring the request records it in the very set the
+  // fold subtracts, so a state derived from that fold holds "decided elsewhere"
+  // for exactly one render and then reverts to a card that looks live again —
+  // the leftover this panel exists to remove. The latch keeps the presentation
+  // and the recorded decision for as long as this panel is mounted on the
+  // request, whatever the fold reports afterwards.
+  const [decidedElsewhere, setDecidedElsewhere] = useState<readonly SettledApproval[]>([])
+  useEffect(() => {
+    if (settledHere.length === 0) return
+    setDecidedElsewhere(current => current.length === 0 ? settledHere : current)
+  }, [settledHere.length])
   return (
     <PanelFlow
-      key={`${callId ?? props.matched.toolName}:${String(settledHere.length > 0)}`}
+      key={callId ?? props.matched.toolName}
       matched={props.matched}
       panel={props.panel}
       pending={pending}
-      settled={settledHere}
+      decidedElsewhere={decidedElsewhere}
       command={command}
       reason={reason}
       t={props.t}
@@ -94,11 +105,11 @@ export function ApprovalPanel(props: LarkApprovalPanelProps & InjectFace<LarkApp
   )
 }
 
-function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {
+function PanelFlow({ matched, panel, pending, decidedElsewhere, command, reason, t }: {
   readonly matched: PanelTarget
   readonly panel: PanelFace
   readonly pending: AnswerablePending | undefined
-  readonly settled: readonly SettledApproval[]
+  readonly decidedElsewhere: readonly SettledApproval[]
   readonly command: string | undefined
   readonly reason: string | undefined
   readonly t: PropsLocale<'larkApproval'>['t']
@@ -108,41 +119,46 @@ function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {
   const active = useRef(true)
   const composing = useRef(false)
   const compositionEnded = useRef(false)
+  /** Whether this mount already recorded the elsewhere decision. */
+  const retired = useRef(false)
   useEffect(() => {
     active.current = true
     return () => { active.current = false }
   }, [])
 
-  const settledElsewhere = settled.length > 0
+  const settledElsewhere = decidedElsewhere.length > 0
+  // What the log recorded, when it is one of the two outcomes this panel has a
+  // control for; the fail-closed rest close the copy without submitting.
+  const recordedOutcome = decidedElsewhere[0]?.outcome
+  const inert = answered || settledElsewhere
 
   /**
-   * Retire the requests the log shows were already decided, so the panel the
-   * chat left behind does not stand waiting for a press that can no longer
-   * change anything.
+   * Retire the request the log shows was already decided, so the panel the chat
+   * left behind does not stand waiting for a press that can no longer change
+   * anything.
    *
-   * Each settled request is recorded against its own log identity, which is
-   * what removes it from the fold. The outcome submitted here is discarded:
-   * the channel's listener already returned the real decision to the Host, so
-   * the forwarded waterfall this browser still holds resolves into a race that
-   * finished long ago. Submitting anything only closes this page's copy without
-   * touching the decision that was actually taken — which is why the value is
-   * arbitrary and only its arrival matters. A request the Client no longer
-   * presents, or one another surface settled in the same tick, needs nothing —
-   * the shipped class rejects a second settlement, which is the expected
-   * outcome here and not a failure.
+   * Each settled request is recorded against its own log identity, which is what
+   * removes it from the fold. The outcome submitted here is the one the log
+   * recorded, not a value of this panel's choosing: the channel's listener
+   * already returned the real decision to the Host, so what this closes is this
+   * page's copy — and a copy closed with the decision that was actually taken
+   * cannot misreport it. The ref keeps that submission to one per mount.
    */
   useEffect(() => {
-    const retire = retirementFor(settled, pending)
+    if (retired.current) return
+    const retire = retirementFor(decidedElsewhere, pending)
     if (retire.length === 0) return
+    retired.current = true
     for (const requestId of retire) panel.markAnsweredHere(matched.sessionId, requestId)
-    void pending?.answer('allowed-once').catch(() => {})
-  }, [settled, pending, panel, matched.sessionId])
+    if (recordedOutcome === undefined) return
+    void pending?.answer(recordedOutcome).catch(() => {})
+  }, [decidedElsewhere, recordedOutcome, pending, panel, matched.sessionId])
 
   const answer = (outcome: 'allowed-once' | 'rejected'): void => {
-    if (waiting.current || pending === undefined || !pending.answerable) return
+    if (inert || waiting.current || pending === undefined || !pending.answerable) return
     waiting.current = true
     setAnswered(true)
-    for (const approval of settled) panel.markAnsweredHere(matched.sessionId, approval.id)
+    for (const approval of decidedElsewhere) panel.markAnsweredHere(matched.sessionId, approval.id)
     void pending.answer(outcome).catch(() => {
       if (!active.current) return
       waiting.current = false
@@ -151,6 +167,10 @@ function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {
   }
 
   const keydown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    // A settled panel takes no keyboard decision either: the buttons are
+    // disabled, and Enter on a panel that says "decided elsewhere" would
+    // otherwise submit one.
+    if (inert) return
     const element = event.target as Element
     if (event.defaultPrevented || !event.currentTarget.contains(document.activeElement)
       || element.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]') !== null) return
@@ -164,7 +184,6 @@ function PanelFlow({ matched, panel, pending, settled, command, reason, t }: {
     answer(event.key === 'Enter' ? 'allowed-once' : 'rejected')
   }
 
-  const inert = answered || settledElsewhere
   return (
     <div className={css.root} data-approval-key={matched.key} aria-busy={inert}
       onKeyDown={keydown}

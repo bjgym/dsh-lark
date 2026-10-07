@@ -19,11 +19,29 @@
  * @module dsh-lark-channel/diag
  */
 
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
 /** Where diagnostics land when no deployment overrides the location. */
 export const DEFAULT_DIAG_FILENAME = 'dsh-lark-diagnostics.log'
+
+/**
+ * Ceiling on the diagnostics file, in bytes.
+ *
+ * A sink that only ever appends is a disk-filling bug with a long fuse: this
+ * channel's own reports scale with traffic (`diagnoseSessions` writes a line per
+ * withheld session, `debug` traces every interaction), and a bot is meant to run
+ * for months. Past the ceiling the file is restarted with a line saying why.
+ */
+export const DIAG_MAX_BYTES = 5 * 1024 * 1024
+
+/**
+ * Writes between two size checks. The sink sits on the reporting path, so a
+ * `statSync` per line would charge every report for bookkeeping; a file that
+ * outgrows the ceiling is noticed within this many lines, long before it could
+ * matter.
+ */
+const SIZE_CHECK_EVERY = 256
 
 /** Severity of one diagnostic line, ordered as the levels are. */
 export type DiagLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -52,6 +70,36 @@ export interface FileDiagOptions {
    * directory, and guessing wrong would scatter files beside it.
    */
   readonly directoryWhenExtensionless?: boolean | undefined
+  /** Ceiling in bytes before the file is restarted; defaults to {@link DIAG_MAX_BYTES}. */
+  readonly maxBytes?: number | undefined
+}
+
+/**
+ * Restart the file once it has grown past its ceiling.
+ *
+ * Truncated in place, with one line saying why, rather than rotated: this is a
+ * file the operator reads at a path they configured, and a rotation would leave
+ * them reading a path that no longer receives anything. A file that cannot be
+ * measured yet — the first write of a process — is left to the append below,
+ * which creates it.
+ * @param path - the diagnostics file.
+ * @param ceiling - the byte ceiling.
+ */
+function restartIfOversized(path: string, ceiling: number): void {
+  let size: number
+  try {
+    size = statSync(path).size
+  } catch {
+    // Nothing there yet: the append that follows creates the file.
+    return
+  }
+  if (size <= ceiling) return
+  writeFileSync(
+    path,
+    `[${new Date().toISOString()}] WARN lark-channel: diagnostics restarted after `
+    + `${String(size)} bytes exceeded the ${String(ceiling)}-byte ceiling\n`,
+    'utf8',
+  )
 }
 
 /** Numeric rank per level, so a floor can be compared. */
@@ -94,13 +142,18 @@ export function createFileDiag(
 ): DiagSink {
   const path = diagFilePath(options)
   const floor = RANK[options.level ?? 'info']
+  const ceiling = options.maxBytes ?? DIAG_MAX_BYTES
   let disabled = false
   let announced = false
+  /** Lines written since the last size check. */
+  let sinceCheck = 0
   return (level, line) => {
     if (disabled || RANK[level] < floor) return
     try {
       mkdirSync(dirname(path), { recursive: true })
+      if (sinceCheck === 0) restartIfOversized(path, ceiling)
       appendFileSync(path, `[${new Date().toISOString()}] ${level.toUpperCase()} ${line}\n`, 'utf8')
+      sinceCheck = (sinceCheck + 1) % SIZE_CHECK_EVERY
     } catch (error: unknown) {
       disabled = true
       if (!announced) {

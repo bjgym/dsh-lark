@@ -6,6 +6,7 @@ import type { AnswerableQuestion, QuestionSpec } from '../src/client/question-st
 import { createQuestionDrafts } from '../src/client/question-drafts.ts'
 import { foldSettledQuestions } from '../src/client/question-decisions.ts'
 import type { SessionEventWindow } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 /** Two questions, as a model would ask them in one call. */
 const asked: readonly QuestionSpec[] = [
@@ -118,6 +119,8 @@ describe('the recommendation suffix on an option label', () => {
 })
 
 describe('the draft registry a remount restores from', () => {
+  const SESSION = 'lark-oc_1' as SessionId
+  const OTHER = 'web-session' as SessionId
   const progress = {
     index: 1,
     drafts: [
@@ -128,62 +131,86 @@ describe('the draft registry a remount restores from', () => {
 
   it('restores a stored progress that matches the request', () => {
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', progress)
+    drafts.replace(SESSION, 'question:1', progress)
 
-    expect(drafts.read('question:1', 2)).toEqual(progress)
+    expect(drafts.read(SESSION, 'question:1', 2)).toEqual(progress)
   })
 
   it('returns a copy, so component state never aliases the registry', () => {
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', progress)
-    const read = drafts.read('question:1', 2)!
+    drafts.replace(SESSION, 'question:1', progress)
+    const read = drafts.read(SESSION, 'question:1', 2)!
     read.drafts[0]!.selected.push('篡改')
 
-    expect(drafts.read('question:1', 2)!.drafts[0]!.selected).toEqual(['部署'])
+    expect(drafts.read(SESSION, 'question:1', 2)!.drafts[0]!.selected).toEqual(['部署'])
   })
 
   it('restores nothing when the question count no longer matches', () => {
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', progress)
+    drafts.replace(SESSION, 'question:1', progress)
 
-    expect(drafts.read('question:1', 3)).toBeUndefined()
+    expect(drafts.read(SESSION, 'question:1', 3)).toBeUndefined()
   })
 
   it('clamps a stored index the asker shrank past', () => {
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', { index: 5, drafts: progress.drafts })
+    drafts.replace(SESSION, 'question:1', { index: 5, drafts: progress.drafts })
 
-    expect(drafts.read('question:1', 2)!.index).toBe(1)
+    expect(drafts.read(SESSION, 'question:1', 2)!.index).toBe(1)
   })
 
   it('drops a cleared or disposed request', () => {
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', progress)
-    drafts.clear('question:1')
-    expect(drafts.read('question:1', 2)).toBeUndefined()
+    drafts.replace(SESSION, 'question:1', progress)
+    drafts.clear(SESSION, 'question:1')
+    expect(drafts.read(SESSION, 'question:1', 2)).toBeUndefined()
 
-    drafts.replace('question:2', progress)
+    drafts.replace(SESSION, 'question:2', progress)
     drafts.dispose()
-    expect(drafts.read('question:2', 2)).toBeUndefined()
+    expect(drafts.read(SESSION, 'question:2', 2)).toBeUndefined()
   })
 
   it('restores the user\'s wait decision with the draft', () => {
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', { ...progress, wait: 'waiting' })
+    drafts.replace(SESSION, 'question:1', { ...progress, wait: 'waiting' })
 
-    expect(drafts.read('question:1', 2)?.wait).toBe('waiting')
+    expect(drafts.read(SESSION, 'question:1', 2)?.wait).toBe('waiting')
   })
 
   it('prunes every request a Session no longer presents', () => {
     // The live keys come from the request object, which is the only party that
     // knows which sibling cards its Session still holds.
     const drafts = createQuestionDrafts()
-    drafts.replace('question:1', progress)
-    drafts.replace('question:2', progress)
-    drafts.prune(['question:2'])
+    drafts.replace(SESSION, 'question:1', progress)
+    drafts.replace(SESSION, 'question:2', progress)
+    drafts.prune(SESSION, ['question:2'])
 
-    expect(drafts.read('question:1', 2)).toBeUndefined()
-    expect(drafts.read('question:2', 2)).toEqual(progress)
+    expect(drafts.read(SESSION, 'question:1', 2)).toBeUndefined()
+    expect(drafts.read(SESSION, 'question:2', 2)).toEqual(progress)
+  })
+
+  it('keeps another Session\'s drafts when one Session prunes', () => {
+    // One registry serves every conversation the Client renders, while the keep
+    // set names one Session's live cards: pruning must not reach across.
+    const drafts = createQuestionDrafts()
+    drafts.replace(SESSION, 'question:1', progress)
+    drafts.replace(OTHER, 'question:1', progress)
+    drafts.prune(SESSION, [])
+
+    expect(drafts.read(SESSION, 'question:1', 2)).toBeUndefined()
+    expect(drafts.read(OTHER, 'question:1', 2)).toEqual(progress)
+  })
+
+  it('keeps one Session\'s draft when another Session clears the same key', () => {
+    // Request keys are the carrier's own, and nothing promises they are unique
+    // across conversations.
+    const drafts = createQuestionDrafts()
+    drafts.replace(SESSION, 'question:1', progress)
+    drafts.replace(OTHER, 'question:1', progress)
+    drafts.clear(SESSION, 'question:1')
+
+    expect(drafts.read(SESSION, 'question:1', 2)).toBeUndefined()
+    expect(drafts.read(OTHER, 'question:1', 2)).toEqual(progress)
   })
 })
 

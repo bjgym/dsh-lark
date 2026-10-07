@@ -65,9 +65,12 @@ describe('settledForTarget', () => {
     expect(settledForTarget(settled, { sessionId: SESSION, key: 'approval:1', toolName: 'bash', callId: 'call_2' })).toEqual([])
   })
 
-  it('falls back to the tool name when the asker named no call', () => {
+  it('answers nothing for a request whose asker named no tool call', () => {
+    // A request with no call identity cannot be tied to a settled record: the
+    // tool name alone would match any older decision about the same tool, and
+    // the panel would retire a request nobody has answered.
     expect(settledForTarget([{ id: 'a', toolName: 'bash' }], { sessionId: SESSION, key: 'approval:1', toolName: 'bash' }))
-      .toEqual([{ id: 'a', toolName: 'bash' }])
+      .toEqual([])
   })
 
   it('does not answer a panel about a different tool', () => {
@@ -110,7 +113,9 @@ describe('createPanelFace', () => {
     expect(bound.getSnapshot()).toEqual([])
     source.push(entry({ type: 'approval/decided', data: { id: 'a', outcome: 'allowed-once' } }))
     expect(seen).toHaveBeenCalled()
-    expect(bound.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash' }])
+    // The recorded outcome rides along: closing this browser's copy submits the
+    // decision that was actually taken, not one of the panel's choosing.
+    expect(bound.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
   })
 
   it('retires a settled request once this browser records it', () => {
@@ -160,6 +165,16 @@ describe('asPendingApproval', () => {
     const answer = vi.fn(async () => {})
     const pending = { kind: 'approval', answerable: true, answer }
     expect(asPendingApproval(pending)).toMatchObject({ answerable: true })
+  })
+
+  it('declines a request whose submission members are not callable facts', () => {
+    // `answer` is called synchronously out of a click handler and `answerable`
+    // decides whether a press counts, so a projection that omits either must
+    // withdraw the affordances rather than throw or decide from nothing.
+    const face = (value: Record<string, unknown>): { readonly kind: string } => value as { readonly kind: string }
+    expect(asPendingApproval(face({ kind: 'approval', answerable: true }))).toBeUndefined()
+    expect(asPendingApproval(face({ kind: 'approval', answer: async () => {} }))).toBeUndefined()
+    expect(asPendingApproval(face({ kind: 'approval', answerable: 'yes', answer: async () => {} }))).toBeUndefined()
   })
 
   it.each([undefined, { kind: 'question' }, { kind: 'plan-review' }])(

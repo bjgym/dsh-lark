@@ -31,6 +31,17 @@ export interface SettledApproval {
   readonly toolName: string
   /** The exact tool call, when the asker named one. */
   readonly callId?: string
+  /**
+   * The decision the log recorded, when this panel could have submitted it.
+   *
+   * Carried so that closing this browser's own copy submits what was actually
+   * decided rather than a value of this plugin's choosing: the log's outcome is
+   * the fact, and a panel re-submitting `allowed-once` for a request somebody
+   * rejected would be inventing a decision. Absent for the fail-closed outcomes
+   * this panel has no button for (`cancelled`, `unavailable`), where the copy is
+   * closed without submitting anything.
+   */
+  readonly outcome?: 'allowed-once' | 'rejected' | undefined
 }
 
 /**
@@ -51,7 +62,7 @@ export function foldSettledElsewhere(
   answeredHere: ReadonlySet<string>,
 ): readonly SettledApproval[] {
   const asked = new Map<string, SettledApproval>()
-  const decided = new Set<string>()
+  const decided = new Map<string, unknown>()
   for (const entry of window.entries) {
     const event = eventOf(entry)
     if (event === undefined) continue
@@ -66,16 +77,27 @@ export function foldSettledElsewhere(
     }
     // Only a real decision counts. The log writes exactly one `approval/decided`
     // per ask, and every outcome it can carry — including the fail-closed
-    // `'unavailable'` — means nobody is going to press that panel again.
-    if (event.type === 'approval/decided') decided.add(event.data.id)
+    // `'unavailable'` — means nobody is going to press that panel again. The
+    // outcome itself rides along for the ones this panel can re-submit.
+    if (event.type === 'approval/decided') decided.set(event.data.id, event.data.outcome)
   }
   const settled: SettledApproval[] = []
   for (const [id, approval] of asked) {
-    if (!decided.has(id)) continue
+    const outcome = decided.get(id)
+    if (outcome === undefined) continue
     if (answeredHere.has(id)) continue
-    settled.push(approval)
+    settled.push({ ...approval, ...submittableOutcome(outcome) })
   }
   return settled
+}
+
+/**
+ * The log's outcome, when it is one this panel has a control for.
+ * @param outcome - the recorded `approval/decided` outcome.
+ * @returns the outcome to re-submit, or an empty object for the fail-closed rest.
+ */
+function submittableOutcome(outcome: unknown): { outcome?: 'allowed-once' | 'rejected' } {
+  return outcome === 'allowed-once' || outcome === 'rejected' ? { outcome } : {}
 }
 
 /** The durable Session event behind one window entry, or undefined for a transient frame. */

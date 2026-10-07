@@ -259,7 +259,7 @@ describe('apply', () => {
     }
     const bound = inject(LARK).hooks.larkSettled
     bound.subscribe(() => {})
-    expect(bound.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', callId: 'call_1' }])
+    expect(bound.getSnapshot()).toEqual([{ id: 'a', toolName: 'bash', callId: 'call_1', outcome: 'allowed-once' }])
   })
 
   it('retires a settled request through the injected face', () => {

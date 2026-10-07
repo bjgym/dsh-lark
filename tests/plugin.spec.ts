@@ -2134,8 +2134,8 @@ describe('dsh-lark-channel', () => {
       )
       await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
 
-      // Its own settings section and its own credential.
-      expect(store.registered[0]!.ns).toBe('lark-channel-support')
+      // Its own settings row and its own credential.
+      expect(store.written[0]!.ns).toBe('lark-channel-support')
       expect(vault.stored).toEqual([{ ref: 'LARK_APP_SECRET_SUPPORT', value: 'second-secret' }])
 
       // And its own session ids: the same chat under two rows is two agents.
@@ -2169,7 +2169,10 @@ describe('dsh-lark-channel', () => {
     })
 
     it('moves a secret already in the settings document behind a credential', async () => {
-      const store = createFakeSettings({ appId: 'cli_stored', appSecret: 'old-secret' })
+      // The older seam alone: there a stored document is layered under the entry
+      // config by the registration, which is what "already in the settings
+      // document" means on that host.
+      const store = createFakeSettings({ appId: 'cli_stored', appSecret: 'old-secret' }, { legacy: true })
       const vault = createFakeCredentials()
       const harness = await mountChannel(
         { appId: undefined, appSecret: undefined },
@@ -2372,13 +2375,13 @@ describe('dsh-lark-channel', () => {
         },
       )
       await vi.waitFor(() => { expect(harness.fake.state.subscriptions).toBe(INBOUND_SUBSCRIPTIONS) })
-      expect(store.registered[0]!.ns).toBe('lark-channel')
+      expect(store.written[0]!.ns).toBe('lark-channel')
       expect(store.updates).toEqual([{ appId: 'cli_new', appSecret: 'new-secret' }])
       await harness.dispose()
     })
 
     it('uses credentials stored in settings without re-registering', async () => {
-      const store = createFakeSettings({ appId: 'cli_stored', appSecret: 'stored-secret' })
+      const store = createFakeSettings({ appId: 'cli_stored', appSecret: 'stored-secret' }, { legacy: true })
       const registerApp = vi.fn<RegisterAppPort>()
       const harness = await mountChannel(
         { appId: undefined, appSecret: undefined },
@@ -2843,12 +2846,11 @@ describe('dsh-lark-channel', () => {
           values: {
             permissions: {
               currentValue: 'workspace-write',
-              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
             },
           },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
 
@@ -2892,10 +2894,10 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
       await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
       const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
@@ -2933,10 +2935,10 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: 'work' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
       harness.agents.created[0]!.agent.drive(true)
@@ -2972,7 +2974,6 @@ describe('dsh-lark-channel', () => {
           values: {
             permissions: {
               currentValue: 'workspace-write',
-              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
             },
           },
         }),
@@ -3048,12 +3049,11 @@ describe('dsh-lark-channel', () => {
           values: {
             permissions: {
               currentValue: 'workspace-write',
-              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
             },
           },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
       await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
       const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
@@ -3119,7 +3119,7 @@ describe('dsh-lark-channel', () => {
         sessionProjections: {
           snapshot: () => ({
             asOfSeq: 1,
-            values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+            values: { permissions: { currentValue: 'workspace-write' } },
           }),
         },
         permissionPresets: createFakePermissionPresets(),
@@ -3153,7 +3153,7 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
       const harness = await mountChannel({}, {
@@ -3186,10 +3186,10 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
       await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
       const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
@@ -3215,10 +3215,10 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       // A chat that has been through `/new` leaves its earlier session behind
       // in the bridge's tables. A click that resolved the conversation by chat
       // would find that first, dead binding and refuse — beside a
@@ -3259,10 +3259,10 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
       await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
@@ -3298,10 +3298,10 @@ describe('dsh-lark-channel', () => {
       const sessionProjections = {
         snapshot: () => ({
           asOfSeq: 1,
-          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          values: { permissions: { currentValue: 'workspace-write' } },
         }),
       }
-      const harness = await mountChannel({}, { commands, sessionProjections })
+      const harness = await mountChannel({}, { commands, sessionProjections, permissionPresets: createFakePermissionPresets() })
       await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
       await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
       const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
@@ -3476,7 +3476,6 @@ describe('dsh-lark-channel', () => {
           values: {
             permissions: {
               currentValue: 'workspace-write',
-              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
             },
           },
         }),

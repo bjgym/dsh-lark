@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, resolve } from 'node:path'
-import { isSamePath, isWithinContainer } from './containment.ts'
+import { canonicalPathOf, isSamePath, isWithinContainer } from './containment.ts'
 import { epochSessionId } from './epoch.ts'
 import { paginate, type Page } from './pager.ts'
 import type { ConversationSubject } from './session.ts'
@@ -80,13 +80,20 @@ export function expandHome(input: string, home = homedir()): string {
  * would answer "a directory somewhere else" and let a chat point its agent at
  * the whole thing.
  * @param canonical - the canonicalized candidate.
- * @param home - the home directory, canonicalized by the caller's probe.
+ * @param home - the home directory, as `homedir()` spells it.
  * @returns the refusal, or undefined when the directory is specific enough.
  */
 export function forbiddenReason(canonical: string, home = homedir()): string | undefined {
+  // The candidate arrives canonical, so the home it is compared against has to
+  // be canonical too. `isSamePath` compares with `relative`, which folds case
+  // where the host folds it but follows no link: a `$HOME` reached through one
+  // (`/home/x -> /mnt/data/x` is a common server layout, and 8.3 short names
+  // are the Windows version) would compare unequal to its own canonical form,
+  // and the guards below would not fire at all.
+  const base = canonicalPathOf(home) ?? home
   if (isSamePath(dirname(canonical), canonical)) return '不能把文件系统根目录设为工作区'
-  if (isSamePath(canonical, home)) return '不能把 Home 根目录设为工作区，请选更具体的子目录'
-  if (isSamePath(canonical, dirname(home))) return '不能把用户目录的父级设为工作区'
+  if (isSamePath(canonical, base)) return '不能把 Home 根目录设为工作区，请选更具体的子目录'
+  if (isSamePath(canonical, dirname(base))) return '不能把用户目录的父级设为工作区'
   return undefined
 }
 

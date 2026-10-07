@@ -204,8 +204,14 @@ export function projectedFacts(
   // keys, so the newer face is simply asked first.
   const live = sources.liveSession?.(header.id)
   if (live !== undefined) {
-    const running = sources.projections?.cachedSnapshot?.(live, keys)
-    if (running !== undefined) return running
+    // Guarded like every other read of a composed service here: a registry that
+    // throws must cost this row its projection facts, not the whole listing.
+    try {
+      const running = sources.projections?.cachedSnapshot?.(live, keys)
+      if (running !== undefined) return running
+    } catch {
+      // The stored row below is the same cut, one checkpoint older.
+    }
   }
   if (!cacheAddressable(header)) return undefined
   return sources.cache?.cachedSnapshot({

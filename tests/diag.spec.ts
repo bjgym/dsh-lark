@@ -94,4 +94,29 @@ describe('writing diagnostics to a file', () => {
     expect(failures).toHaveLength(1)
     expect(failures[0]).toContain('diagnostics cannot be written')
   })
+
+  it('restarts the file once it outgrows its ceiling', () => {
+    // An append-only sink is a disk-filling bug with a long fuse: the channel is
+    // meant to run for months, and its own reports scale with traffic.
+    const file = join(scratch(), 'lark.log')
+    createFileDiag({ file, maxBytes: 200 })('warn', 'x'.repeat(400))
+    expect(readFileSync(file, 'utf8')).toContain('xxxx')
+    // The size check runs at the start of a sink's first write (and every 256
+    // lines after), so a fresh sink over the ceiling restarts the file.
+    createFileDiag({ file, maxBytes: 200 })('warn', 'after')
+    const written = readFileSync(file, 'utf8')
+    expect(written).toContain('diagnostics restarted after')
+    expect(written).toContain('after')
+    expect(written).not.toContain('xxxx')
+  })
+
+  it('leaves a file under its ceiling alone', () => {
+    const file = join(scratch(), 'lark.log')
+    createFileDiag({ file, maxBytes: 10_000 })('warn', 'first')
+    createFileDiag({ file, maxBytes: 10_000 })('warn', 'second')
+    const written = readFileSync(file, 'utf8')
+    expect(written).toContain('first')
+    expect(written).toContain('second')
+    expect(written).not.toContain('diagnostics restarted')
+  })
 })

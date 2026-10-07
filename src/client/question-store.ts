@@ -312,5 +312,11 @@ export function asPendingQuestion(
   pending: { readonly kind: string } | undefined,
 ): AnswerableQuestion | undefined {
   if (pending === undefined || pending.kind !== 'question') return undefined
+  // `answer` is called synchronously out of a click and key handler, so a
+  // projection that omits it would throw past the caller's `.catch`.
+  // Withdrawing the affordances is the honest read of a request this panel
+  // cannot answer.
+  const face = pending as { readonly answer?: unknown }
+  if (typeof face.answer !== 'function') return undefined
   return pending as unknown as AnswerableQuestion
 }

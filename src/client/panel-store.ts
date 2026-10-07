@@ -95,16 +95,26 @@ export interface PanelFace {
 
 /**
  * The settled requests that answer one panel's question.
+ *
+ * The correlation is by tool CALL and never by tool name. An approval's own
+ * identity is the call it is about, and the log records that call on both the
+ * ask and the decision; a request whose asker named no call therefore has no
+ * identity the log can tie a settlement to. Matching such a request by tool
+ * name would find any older decision about the same tool and treat it as this
+ * panel's answer — the panel would then say "decided elsewhere" over a request
+ * nobody has answered, and retire it on the user's behalf. Answering nothing is
+ * the honest read, and it leaves the panel waiting for a press exactly as the
+ * shipped one does.
  * @param settled - the conversation's settled approvals.
  * @param target - the request the panel presents.
- * @returns matching settled approvals, empty when the request is still open.
+ * @returns matching settled approvals, empty when the request names no call.
  */
 export function settledForTarget(
   settled: readonly SettledApproval[],
   target: PanelTarget,
 ): readonly SettledApproval[] {
-  return settled.filter(approval =>
-    target.callId === undefined ? approval.toolName === target.toolName : approval.callId === target.callId)
+  if (target.callId === undefined) return []
+  return settled.filter(approval => approval.callId === target.callId)
 }
 
 /**
@@ -161,5 +171,13 @@ export function asPendingApproval(
   pending: { readonly kind: string } | undefined,
 ): AnswerablePending | undefined {
   if (pending === undefined || pending.kind !== 'approval') return undefined
+  // `answer` is called synchronously out of a click and key handler, so a
+  // projection that omits it would throw past the caller's `.catch`, and
+  // `answerable` is what the press guard tests, so a non-boolean would decide
+  // from a value nobody defined. Withdrawing the affordances is the honest read
+  // of a request this panel cannot answer.
+  const face = pending as { readonly answer?: unknown; readonly answerable?: unknown }
+  if (typeof face.answer !== 'function') return undefined
+  if (typeof face.answerable !== 'boolean') return undefined
   return pending as unknown as AnswerablePending
 }

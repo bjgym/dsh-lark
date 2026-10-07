@@ -22,6 +22,16 @@
  * exactly this purpose, so the panel reads the source directly rather than
  * taking a second presentation package as a dependency.
  *
+ * That direct read is a RECORDED DEVIATION from the client stack's rule that a
+ * business component carries no subscription machinery (business data reaches a
+ * render through a framework hook or a declared store): `useQuestionCard` is the
+ * one `useSyncExternalStore` in this package, it exists because the seat that
+ * would replace it lives in a package this one must not value-import, and the
+ * alternative — a second presentation package in the dependency list — trades a
+ * contained deviation for a wider one. Every other live read here (the settled
+ * fold, the drafts) arrives through the registration's `inject` face as the rule
+ * requires.
+ *
  * Plan reviews stay with the shipped panel: this channel answers plans through
  * its own shadowed tool in the chat, so this entry claims only `question`
  * interactions.
@@ -41,7 +51,7 @@ import {
   IconEditOutlineRegular, MarkdownText, StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { HostObservable, InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { AnswerableQuestion, QuestionCardState, QuestionFace, QuestionTarget } from './question-store.ts'
+import type { AnswerableQuestion, QuestionAnswerItem, QuestionCardState, QuestionFace, QuestionSpec, QuestionTarget } from './question-store.ts'
 import { answerBatchOf, asPendingQuestion, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion } from './question-store.ts'
 import type { QuestionDraftAnswer, QuestionDraftProgress, QuestionDraftsFace } from './question-drafts.ts'
 import type { SettledQuestion } from './question-decisions.ts'
@@ -91,6 +101,20 @@ type Feedback =
 const REMOVED_CARD: QuestionCardState = {
   state: 'open', waitState: 'counting', countdown: undefined, channel: 'none', closed: true,
 }
+
+/**
+ * The question a projection carrying none at all presents.
+ *
+ * The Host refuses an empty batch (its schema is `.min(1)`), so this is a
+ * malformed-projection fallback: rendering one inert card with no text is the
+ * honest read of a request that names nothing, and it keeps an index lookup
+ * from throwing out of a mounted panel. The card it draws is inert, so nothing
+ * can be submitted from it.
+ */
+const EMPTY_QUESTION: QuestionSpec = { id: '', question: '' }
+
+/** The draft an index that outlived a shrunken batch falls back to. */
+const EMPTY_DRAFT: QuestionDraftAnswer = { selected: [], custom: '', skipped: false }
 
 /**
  * Follow the live card state of one request.
@@ -212,11 +236,21 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   // A read-only card built from a settled call's transcript: the same panel
   // over the recorded answers, with nothing left to submit.
   const review = pending?.review
-  const settledElsewhere = settled.length > 0
+  // Latched, never derived: the retirement further down records the answered
+  // request in the same fold this reads from, so a state derived from that fold
+  // would show the record for exactly one render and then drop it — leaving a
+  // panel that invites a press on a request somebody already answered, and
+  // losing the "what was actually answered" the record exists to show.
+  const [answeredElsewhere, setAnsweredElsewhere] = useState<readonly QuestionAnswerItem[] | undefined>(undefined)
+  useEffect(() => {
+    if (settled.length === 0) return
+    setAnsweredElsewhere(current => current ?? settled[0]?.answers)
+  }, [settled.length])
+  const settledElsewhere = answeredElsewhere !== undefined
   // The log's own record doubles as the display once another surface answered:
   // the card closes showing what was actually answered, never this browser's
   // drafts.
-  const record = review ?? (settledElsewhere ? settled[0]?.answers : undefined)
+  const record = review ?? answeredElsewhere
   const card = useQuestionCard(pending)
   const canSubmit = card.channel !== 'none'
   const markdownLabels = useMemo(() => ({
@@ -252,7 +286,7 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
     const recommended = record === undefined ? recommendedFirstOption(item) : undefined
     return { selected: recommended === undefined ? [] : [recommended], custom: '', skipped: false }
   }), [questions, record])
-  const stored = drafts.read(matched.key, questions.length)
+  const stored = drafts.read(matched.sessionId, matched.key, questions.length)
   // A card holding a record renders the record itself, so a draft its live
   // incarnation left behind can never surface as an answer; only the page
   // position is restored.
@@ -288,6 +322,18 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   // The user's own wait decision, re-applied to the request on mount: the card
   // owns the countdown, so a remounted panel must tell it what the user chose.
   const waitDisposition = useRef<'editing' | 'waiting' | undefined>(restoredWait)
+  /** Whether this mount already recorded the elsewhere answer. */
+  const retired = useRef(false)
+  /**
+   * Whether a submission is in flight.
+   *
+   * A ref rather than the `busy` state: two activations can land in one batch —
+   * an option row's Enter plus the submit button, or a key repeat — before a
+   * re-render disables either control, and the second would submit the same
+   * batch again. The shipped class rejects the duplicate, and that rejection
+   * would surface to the user as a raw failure on an answer that did land.
+   */
+  const submitting = useRef(false)
   useEffect(() => {
     active.current = true
     return () => { active.current = false }
@@ -304,8 +350,10 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
    * settlement, which is the expected outcome here and not a failure.
    */
   useEffect(() => {
+    if (retired.current) return
     const retire = retirementForQuestion(settled, pending)
     if (retire.length === 0) return
+    retired.current = true
     for (const requestId of retire) panel.markAnsweredHere(matched.sessionId, requestId)
     void pending?.answer({ answers: settled[0]?.answers ?? [] }).catch(() => {})
   }, [settled, pending, panel, matched.sessionId])
@@ -318,15 +366,18 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   // A closed card has nothing left to answer: its draft must not surface as an
   // answer for the next request that reuses the seat.
   useEffect(() => {
-    if (card.closed) drafts.clear(matched.key)
-  }, [card.closed, drafts, matched.key])
+    if (card.closed) drafts.clear(matched.sessionId, matched.key)
+  }, [card.closed, drafts, matched.sessionId, matched.key])
 
   // Drafts of requests this Session no longer presents are stale by definition;
-  // the request object knows which sibling cards are still live.
+  // the request object knows which sibling cards are still live. Only THIS
+  // Session's drafts are reconciled: the registry is shared by every
+  // conversation the Client renders, and a keep-set from one Session would
+  // otherwise delete another's typed answers.
   useEffect(() => {
     const live = pending?.liveKeys?.()
-    if (live !== undefined) drafts.prune(live)
-  }, [drafts, pending])
+    if (live !== undefined) drafts.prune(matched.sessionId, live)
+  }, [drafts, pending, matched.sessionId])
 
   useEffect(() => {
     if (sentVia.current !== 'waterfall' || card.state !== 'continued') return
@@ -341,16 +392,18 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   const countdown = card.countdown
   // A card holding a record renders the record, not this browser's drafts.
   const shownDrafts = record === undefined ? progress.drafts : recordDrafts
-  // oxlint-disable-next-line typescript/no-non-null-assertion
-  const question = questions[progress.index]!
-  // oxlint-disable-next-line typescript/no-non-null-assertion
-  const draft = shownDrafts[progress.index]!
+  // Both lookups are total. A projection that carries no question, or a stored
+  // index that outlived a shrunken batch, must render rather than throw out of
+  // a mounted panel; the empty-question case renders inert below, so nothing
+  // can be submitted from it either.
+  const question = questions[progress.index] ?? questions[0] ?? EMPTY_QUESTION
+  const draft = shownDrafts[progress.index] ?? shownDrafts[0] ?? EMPTY_DRAFT
   const hasOptions = (question.options?.length ?? 0) > 0
   // A card holding a record has nothing left to answer, and a submission in
   // flight freezes the surface; the request itself may also be absent on a
-  // projection that lost it.
+  // projection that lost it, and a batch with no questions has nothing to send.
   const readOnly = record !== undefined
-  const inert = readOnly || busy !== null || settledElsewhere || pending === undefined
+  const inert = questions.length === 0 || readOnly || busy !== null || settledElsewhere || pending === undefined
 
   const replaceProgress = (nextIndex: number, nextDrafts: QuestionDraftAnswer[]): void => {
     const next: QuestionDraftProgress = {
@@ -359,7 +412,7 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
       ...(waitDisposition.current === undefined ? {} : { wait: waitDisposition.current }),
     }
     setProgress(next)
-    drafts.replace(matched.key, next)
+    drafts.replace(matched.sessionId, matched.key, next)
     setError(null)
   }
 
@@ -465,7 +518,7 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   const completed = (item: QuestionDraftAnswer): boolean => answered(item) || item.skipped
 
   const submitDrafts = (values: QuestionDraftAnswer[]): void => {
-    if (pending === undefined) return
+    if (pending === undefined || submitting.current) return
     const missing = values.findIndex(item => !completed(item))
     if (missing >= 0) {
       replaceProgress(missing, values)
@@ -476,6 +529,7 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
       setError({ key: 'error.unavailable' })
       return
     }
+    submitting.current = true
     setBusy('answer')
     setError(null)
     // The external-store render can lag the carrier as a timed call continues.
@@ -491,6 +545,7 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
         void pending.dismiss?.().catch(() => { setError({ key: 'status.sent' }) })
       })
       .catch((cause: unknown) => {
+        submitting.current = false
         if (!active.current) return
         sentVia.current = null
         setBusy(null)
@@ -637,6 +692,7 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
                       disabled={inert}
                       onClick={() => { choose(option.label) }}
                       onKeyDown={(event) => {
+                        if (inert) return
                         if (event.key !== 'Enter' || !progress.drafts.every(completed)) return
                         event.preventDefault()
                         submitDrafts(progress.drafts)

@@ -37,14 +37,14 @@ describe('foldSettledElsewhere', () => {
     expect(foldSettledElsewhere(window(asked('a')), new Set())).toEqual([])
   })
 
-  it('reports a request decided by somebody else', () => {
+  it('reports a request decided by somebody else, with the decision it recorded', () => {
     expect(foldSettledElsewhere(window(asked('a'), decided('a')), new Set()))
-      .toEqual([{ id: 'a', toolName: 'bash' }])
+      .toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
   })
 
   it('carries the tool call when the asker named one', () => {
     expect(foldSettledElsewhere(window(asked('a', 'fs_write', 'call_1'), decided('a', 'rejected')), new Set()))
-      .toEqual([{ id: 'a', toolName: 'fs_write', callId: 'call_1' }])
+      .toEqual([{ id: 'a', toolName: 'fs_write', callId: 'call_1', outcome: 'rejected' }])
   })
 
   it('never reports a request this browser answered itself', () => {
@@ -55,12 +55,22 @@ describe('foldSettledElsewhere', () => {
   it('keeps reporting the requests this browser did not answer', () => {
     const answered = new Set(['a'])
     expect(foldSettledElsewhere(window(asked('a'), decided('a'), asked('b', 'read'), decided('b')), answered))
-      .toEqual([{ id: 'b', toolName: 'read' }])
+      .toEqual([{ id: 'b', toolName: 'read', outcome: 'allowed-once' }])
   })
 
-  it.each(['allowed-once', 'rejected', 'cancelled', 'unavailable'] as const)(
-    'treats the %s outcome as settled',
+  it.each(['allowed-once', 'rejected'] as const)(
+    'carries the %s outcome the panel has a control for',
     (outcome) => {
+      expect(foldSettledElsewhere(window(asked('a'), decided('a', outcome)), new Set()))
+        .toEqual([{ id: 'a', toolName: 'bash', outcome }])
+    },
+  )
+
+  it.each(['cancelled', 'unavailable'] as const)(
+    'treats the %s outcome as settled with nothing to re-submit',
+    (outcome) => {
+      // Fail-closed outcomes have no button in this panel: the copy is closed,
+      // and inventing a decision for it would misreport what the Host recorded.
       expect(foldSettledElsewhere(window(asked('a'), decided('a', outcome)), new Set()))
         .toEqual([{ id: 'a', toolName: 'bash' }])
     },
@@ -78,6 +88,6 @@ describe('foldSettledElsewhere', () => {
   it('ignores transient frames', () => {
     const transient = { type: 'transient', event: { type: 'assistant/live-chunk' } } as unknown as SessionEventLikeEntry
     expect(foldSettledElsewhere(window(transient, asked('a'), transient, decided('a')), new Set()))
-      .toEqual([{ id: 'a', toolName: 'bash' }])
+      .toEqual([{ id: 'a', toolName: 'bash', outcome: 'allowed-once' }])
   })
 })
