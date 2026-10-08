@@ -36,6 +36,22 @@ class SupersededError extends Error {
 }
 
 /**
+ * A session this channel must not open, reported in the chat's own words.
+ *
+ * The ladder falls through to `create` whenever a resume fails, because a
+ * rejection is its only existence probe and "never served here" is the ordinary
+ * case. An id that exists but may not run is the opposite case: creating an
+ * agent under it would answer a refusal by writing over the very session that
+ * was refused, so a refusal ends the walk instead of advancing it.
+ */
+export class SessionRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SessionRefusedError'
+  }
+}
+
+/**
  * Which conversation a control card governs, and where it was published.
  *
  * A card that changes a conversation's settings has to say which conversation
@@ -425,6 +441,10 @@ export class ConversationSessions {
     try {
       return { handle: await this.ladder.resume(sessionId), owned: true }
     } catch (error) {
+      // A refusal is terminal: the session exists and this channel declined to
+      // open it, so falling through would create an agent under the id the
+      // refusal just named.
+      if (error instanceof SessionRefusedError) throw error
       // The registry offers no existence probe, so a rejection is the only
       // signal that this conversation was never served here — and an unreadable
       // log looks exactly the same. Reporting it keeps a corrupt session log

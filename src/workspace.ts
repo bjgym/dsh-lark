@@ -122,6 +122,22 @@ export function withinRoots(path: string, roots: readonly string[]): boolean {
 }
 
 /**
+ * The directory override a stored or configured value actually names.
+ *
+ * The value arrives from configuration and from the settings document, which
+ * are hand-editable: anything that is not a non-empty string names no
+ * directory. Guards the id derivation, because the alternative is worse than
+ * ignoring a bad entry — the derivation HASHES this value, and a non-string
+ * there threw out of the bridge's own installation, leaving a connected
+ * transport with no handlers and a chat that answered nothing.
+ * @param value - whatever the entry held.
+ * @returns the usable directory, or undefined for "the deployment default".
+ */
+export function workspaceOverride(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
  * The session id one conversation-and-workspace pair owns. The default
  * workspace keeps the historical plain id, so existing conversations keep their
  * sessions across this feature's arrival; an override appends a digest of the
@@ -129,12 +145,14 @@ export function withinRoots(path: string, roots: readonly string[]): boolean {
  * two directories never share.
  * @param key - conversation key.
  * @param overridePath - canonical override directory, absent for the default.
+ * @param prefix - this row's session prefix, absent for the original one.
  * @returns the branded session id.
  */
-export function workspaceSessionId(key: string, overridePath?: string, prefix?: string): string {
+export function workspaceSessionId(key: string, overridePath?: unknown, prefix?: string): string {
   const base = sessionIdFor(key, prefix)
-  if (overridePath === undefined) return base
-  return `${base}--${createHash('sha256').update(overridePath).digest('hex').slice(0, 10)}`
+  const override = workspaceOverride(overridePath)
+  if (override === undefined) return base
+  return `${base}--${createHash('sha256').update(override).digest('hex').slice(0, 10)}`
 }
 
 /** What one `/cd` attempt concluded. */
@@ -171,8 +189,11 @@ export interface ChatWorkspacesOptions {
   /** Prefix this row's session ids carry; absent keeps the original one. */
   readonly sessionPrefix?: string | undefined
   /**
-   * How many times a conversation has started over, by the id it derives at
-   * epoch zero. Absent keeps every conversation on its first.
+   * The legacy epoch a stored conversation still runs on, by the id it derives
+   * at epoch zero. Absent keeps every conversation on its first. Nothing
+   * advances this any more — `/new` mints an id instead — but conversations
+   * that were moved by the old counter are still on their `--e<N>` session, and
+   * the id is the only pointer to that thread.
    */
   readonly epochOf?: ((baseId: string) => number) | undefined
   /**
@@ -216,7 +237,12 @@ export class ChatWorkspaces {
     this.known = options.known ?? (() => [])
     this.sessionPrefix = options.sessionPrefix
     this.epochOf = options.epochOf ?? (() => 0)
-    this.entries = new Map(Object.entries(options.entries ?? {}))
+    // Only entries that name a directory are kept: the document is
+    // hand-editable, and one junk value used to reach the id derivation's hash
+    // and take the whole bridge install down with it.
+    this.entries = new Map(Object.entries(options.entries ?? {})
+      .map(([key, value]) => [key, workspaceOverride(value)] as const)
+      .filter((pair): pair is readonly [string, string] => pair[1] !== undefined))
     const probed = this.probe(this.defaultPath)
     this.defaultCanonical = 'canonical' in probed ? probed.canonical : this.defaultPath
   }
@@ -228,20 +254,30 @@ export class ChatWorkspaces {
   }
 
   /**
-   * The id this conversation derives before it ever started over. The epoch
-   * map is keyed by it, so a `/new` in one directory leaves the thread in
-   * another untouched.
+   * The id this conversation derives at the directory it is in, before any
+   * suffix. A session minted for the conversation is minted under it, and the
+   * conversation's pointer is keyed by it — so starting over in one directory
+   * leaves the thread in another untouched.
    * @param key - conversation key.
-   * @returns the session id at epoch zero.
+   * @returns the anchor id.
    */
   baseSessionIdFor(key: string): string {
-    const entry = this.entries.get(key)
+    const entry = workspaceOverride(this.entries.get(key))
     return entry === undefined || entry === DEFAULT_MARKER
       ? workspaceSessionId(key, undefined, this.sessionPrefix)
       : workspaceSessionId(key, entry, this.sessionPrefix)
   }
 
-  /** The session id one conversation currently resolves to. */
+  /**
+   * The session id one conversation derives on its own.
+   *
+   * A pointer normally decides which session a conversation runs, so this is
+   * what that pointer falls back to — and what a conversation that never
+   * pointed anywhere has always run. The legacy epoch only appears for a
+   * conversation an older release moved, which is still on that session.
+   * @param key - conversation key.
+   * @returns the derived session id.
+   */
   sessionIdFor(key: string): string {
     const base = this.baseSessionIdFor(key)
     return epochSessionId(base, this.epochOf(base))
@@ -255,11 +291,15 @@ export class ChatWorkspaces {
    */
   knownPaths(): string[] {
     const paths = [this.defaultCanonical]
+    // Compared with `isSamePath` rather than `===`: these paths are canonical,
+    // and on a case-folding host (macOS, Windows) two spellings of one directory
+    // are one directory — `includes` would list it twice, once as the default
+    // and once as a switch target, and `/ws` would offer a duplicate row.
     for (const entry of this.entries.values()) {
-      if (entry !== DEFAULT_MARKER && !paths.includes(entry)) paths.push(entry)
+      if (entry !== DEFAULT_MARKER && !paths.some(path => isSamePath(path, entry))) paths.push(entry)
     }
     for (const path of this.known()) {
-      if (!paths.includes(path)) paths.push(path)
+      if (!paths.some(known => isSamePath(known, path))) paths.push(path)
     }
     return paths
   }
@@ -299,7 +339,7 @@ export class ChatWorkspaces {
     const canonical = probed.canonical
     // The deployment default is always reachable: the operator chose it, and
     // the guards below narrow what CHATS may add, not what the deployment runs.
-    const toDefault = canonical === this.defaultCanonical
+    const toDefault = isSamePath(canonical, this.defaultCanonical)
     if (!toDefault) {
       const forbidden = forbiddenReason(canonical, this.home)
       if (forbidden !== undefined) return { ok: false, reason: `${forbidden}。` }
@@ -364,11 +404,13 @@ export interface WorkspaceChoice {
 export function workspaceChoices(store: ChatWorkspaces, key: string): WorkspaceChoice[] {
   const current = store.pathFor(key)
   const paths = store.knownPaths()
-  const rows = paths.map((path): WorkspaceChoice => ({
+  const rows = paths.map((path, index): WorkspaceChoice => ({
     path,
     name: basename(path),
-    isDefault: path === paths[0],
-    current: path === current,
+    // The list is built with the default first, so the index IS the answer here;
+    // comparing paths would ask the same question a second time.
+    isDefault: index === 0,
+    current: isSamePath(path, current),
   }))
   // Stable within each group: the current row is moved, never re-sorted, so the
   // rest keep the registry's order and a reader finds a directory where the

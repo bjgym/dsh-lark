@@ -15,7 +15,7 @@ import { SESSIONS_COMMAND } from './sessions.ts'
 import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
 import { MODEL_COMMAND } from './model.ts'
 import { STATUS_COMMAND } from './status.ts'
-import { NEW_COMMAND } from './epoch.ts'
+import { NEW_COMMAND } from './new-session.ts'
 
 /** Cancel the running turn. Not a host command: cancellation is an agent method. */
 export const STOP_COMMAND = 'stop'
@@ -70,7 +70,7 @@ export function helpText(commands: HostCommands | undefined, agent: HostAgent): 
     `\`/${GET_COMMAND} <路径>\` — 把工作区里的文件发到聊天`,
     `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
-    `\`/${NEW_COMMAND}\` — 开一个新会话，清空上下文`,
+    `\`/${NEW_COMMAND}\` — 开一个新会话（全新 id），清空上下文`,
     `\`/${SESSIONS_COMMAND}\` — 列出可接续的会话，点一行就切过去`,
     `\`/${HELP_COMMAND}\` — 显示这条帮助`,
   ]

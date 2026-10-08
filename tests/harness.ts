@@ -65,7 +65,7 @@ export interface StreamedCard {
 }
 
 /** An in-memory {@link ChannelPort} recording traffic and replaying inbound events. */
-export function createFakePort() {
+export function createFakePort(options: { failSubscribe?: boolean } = {}) {
   const messageHandlers: MessageHandler[] = []
   const cardHandlers: CardActionHandler[] = []
   /** Every other subscription, by event name, so a test can replay any inbound event. */
@@ -142,6 +142,7 @@ export function createFakePort() {
   }
 
   const subscribe = (name: string, handler: PortHandler): (() => void) => {
+    if (options.failSubscribe === true) throw new Error('the transport refused a handler (fake)')
     const list = listFor(name)
     list.push(handler)
     state.subscriptions += 1
@@ -721,6 +722,13 @@ export async function mountChannel(
      */
     settings?: object
     registerApp?: RegisterAppPort
+    /**
+     * Make the transport refuse its first handler registration, as a bridge that
+     * cannot install does. The failure lands mid-install, after the diagnostic
+     * file exists and the startup notices have been written — which is where a
+     * real one did.
+     */
+    failInstall?: boolean
     presets?: HostAgentPresets
     /**
      * An answerer registered BEFORE the plugin, as a host row that mounts
@@ -798,7 +806,7 @@ export async function mountChannel(
   if (services.credentials !== undefined) ctx.provide('credentials', services.credentials)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
-  const fake = createFakePort()
+  const fake = createFakePort({ failSubscribe: services.failInstall === true })
   const portConfigs: ChannelConfig[] = []
   const notices: string[] = []
   const originalCreatePort = internals.createPort
@@ -833,13 +841,23 @@ export async function mountChannel(
   const fiber = await ctx.plugin(plugin, merged)
   // Activation bootstraps asynchronously; hold until the bridge subscribed when
   // the mount alone is expected to reach a connected channel.
-  if (merged.appId !== undefined && merged.appSecret !== undefined && services.settings === undefined) {
+  if (merged.appId !== undefined && merged.appSecret !== undefined
+    && services.settings === undefined && services.failInstall !== true) {
     await vi.waitFor(() => {
       if (fake.state.subscriptions !== INBOUND_SUBSCRIPTIONS) throw new Error('bridge not subscribed yet')
     })
   }
   return {
-    ctx,
+    // The context as the tests need it: a test's whole point is a session it
+    // never created and an event carrying only the fields the reader under test
+    // looks at, while the host's `emit` is typed for a real `Session` and a
+    // complete `SessionEvent`, and its `waterfall` for a complete request. The
+    // loose overloads are added here, once, rather than casting at fifty call
+    // sites.
+    ctx: ctx as Context & {
+      emit(name: string, ...args: unknown[]): void
+      waterfall(name: string, ...args: unknown[]): Promise<unknown>
+    },
     fiber,
     fake,
     agents,

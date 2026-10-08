@@ -70,9 +70,16 @@ function isCopy(value: Line): value is Copy {
   return typeof value === 'object'
 }
 
-/** Join our copy to a value from elsewhere, in each language's own punctuation. */
+/**
+ * Join our copy to a value from elsewhere, in each language's own punctuation.
+ *
+ * The value is substituted through a FUNCTION, which is what keeps `$&`, `` $` ``
+ * and `$'` literal: a string replacement would read them as replacement patterns
+ * and rewrite this module's own copy — a tool name or a model route carrying one
+ * would come back as `%s`, or duplicate the sentence around it.
+ */
 function fill(copy: { readonly zh: string; readonly en: string }, value: string): Copy {
-  return { zh: copy.zh.replace('%s', value), en: copy.en.replace('%s', value) }
+  return { zh: copy.zh.replace('%s', () => value), en: copy.en.replace('%s', () => value) }
 }
 
 /**
@@ -446,9 +453,28 @@ function contextReading(context: { readonly used: number; readonly window?: numb
 
 /** Cut a string to a budget, reporting what was left out. */
 function clip(value: string, max: number): { readonly shown: string; readonly hidden: number } {
-  return value.length <= max
+  // Cut and counted by CODE POINT: a slice by UTF-16 code unit splits a
+  // surrogate pair into a lone half, and counts a character as two, so the
+  // "N characters truncated" note would be wrong for any emoji or CJK
+  // extension character in a path or a command.
+  const points = [...value]
+  return points.length <= max
     ? { shown: value, hidden: 0 }
-    : { shown: value.slice(0, max), hidden: value.length - max }
+    : { shown: points.slice(0, max).join(''), hidden: points.length - max }
+}
+
+/**
+ * One entry of a literal table, by its own key only.
+ *
+ * `table[key] ?? fallback` is not enough for a string key: `'constructor'`
+ * finds `Object.prototype.constructor`, which is truthy, so the fallback never
+ * fires and the reader goes on to use a function as if it were a table row.
+ * @param table - the literal table.
+ * @param key - the key read off a value from elsewhere.
+ * @returns the entry, or undefined when the table declares no such key.
+ */
+function ownValue<T>(table: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined
 }
 
 /** How much of a pending call's arguments an approval card shows. */
@@ -456,6 +482,35 @@ const COMMAND_MAX_CHARS = 600
 
 /** How much of a model's justification an approval card shows. */
 const REASON_MAX_CHARS = 300
+
+/**
+ * How much of a model's question a card carries, and how much of one option.
+ *
+ * Every other model-authored block here is clipped — a command to 600, a reason
+ * to 300 — because an oversized card is refused by the platform, and a question
+ * whose card never lands is answered empty, which the model reads exactly like a
+ * human who declined. The option ceiling bounds the card's structure the same
+ * way: one row per option means the count is size too.
+ */
+const QUESTION_MAX_CHARS = 600
+const QUESTION_OPTION_LABEL_MAX_CHARS = 80
+const QUESTION_OPTION_DESCRIPTION_MAX_CHARS = 200
+const QUESTION_MAX_OPTIONS = 20
+const QUESTION_HEADER_MAX_CHARS = 120
+
+/**
+ * One string from elsewhere, cut to a budget with an ellipsis.
+ *
+ * For a place that cannot carry a truncation notice of its own — a button label,
+ * a dropdown entry — so the reader still sees that something was left out.
+ * @param value - the text.
+ * @param max - the budget, in code points.
+ * @returns the text, or its clipped form with an ellipsis.
+ */
+function clippedText(value: string, max: number): string {
+  const clipped = clip(value, max)
+  return clipped.hidden === 0 ? value : `${clipped.shown}…`
+}
 
 /** Every string this module says, in the languages it says them. */
 const TRUNCATED = { zh: '已截断 %s 个字符', en: '%s characters truncated' }
@@ -512,6 +567,12 @@ const QUESTION = {
     en: 'Submit once you have picked; if none fit, just reply — your next message is the answer.',
   },
   dropped: { zh: '助手已不再等待这个回答。', en: 'The assistant is no longer waiting on this.' },
+  // The card's own ceiling, said out loud: a model that offered more options
+  // than a card can carry should not read the trimmed set as the whole question.
+  droppedOptions: {
+    zh: '（还有 %s 个选项超出卡片上限，未显示；可以直接回复你的选择。）',
+    en: '(%s more options were past the card limit and are not shown — reply with your choice instead.)',
+  },
 }
 
 /**
@@ -565,12 +626,12 @@ export function approvalCard(input: {
 const UNCONFINED_LABEL = 'danger-full-access'
 
 /** How one approval ended, in the words and colour the settled card uses. */
-const APPROVAL_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
+const APPROVAL_OUTCOME = {
   'allowed-once': { state: 'success', title: { zh: '已允许执行一次', en: 'Allowed once' } },
   rejected: { state: 'danger', title: { zh: '已拒绝执行', en: 'Rejected' } },
   cancelled: { state: 'neutral', title: { zh: '请求已撤回', en: 'Request withdrawn' } },
   unavailable: { state: 'neutral', title: { zh: '无法作答', en: 'Could not be answered' } },
-}
+} satisfies Record<string, { readonly state: CardState; readonly title: Copy }>
 
 /**
  * The card an approval is replaced with once decided — no live buttons, and
@@ -585,7 +646,10 @@ export function settledApprovalCard(input: {
   /** Whether another surface answered, so no press happened here. */
   readonly decidedElsewhere?: boolean | undefined
 }): object {
-  const settled = APPROVAL_OUTCOME[input.outcome] ?? APPROVAL_OUTCOME.cancelled!
+  // Looked up by own key: `APPROVAL_OUTCOME['constructor']` finds something on
+  // the prototype chain, and a fallback written as `?? cancelled` never fires
+  // for it — the card would then read a field off a function and throw.
+  const settled = ownValue(APPROVAL_OUTCOME, input.outcome) ?? APPROVAL_OUTCOME.cancelled
   // Who decided, named rather than withheld: with approvals open to a room,
   // the room should see whose press granted the escalation. When the decision
   // came from the other surface there is no name to give, and naming the wrong
@@ -668,12 +732,12 @@ export function fileApprovalCard(input: {
  * A request nobody answered in time is presented as withdrawn, because from the
  * room's side that is what it was.
  */
-const FILE_SEND_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
+const FILE_SEND_OUTCOME = {
   'allowed-once': { state: 'success', title: { zh: '已允许发送', en: 'Send allowed' } },
   rejected: { state: 'danger', title: { zh: '已拒绝发送', en: 'Send rejected' } },
   cancelled: { state: 'neutral', title: { zh: '请求已撤回', en: 'Request withdrawn' } },
   unavailable: { state: 'neutral', title: { zh: '无法发送', en: 'Could not be sent' } },
-}
+} satisfies Record<string, { readonly state: CardState; readonly title: Copy }>
 
 /**
  * The card a file approval is replaced with once decided — no live buttons, and
@@ -695,7 +759,7 @@ export function settledFileApprovalCard(input: {
   readonly outcome: string
   readonly decidedBy?: string | undefined
 }): object {
-  const settled = FILE_SEND_OUTCOME[input.outcome] ?? FILE_SEND_OUTCOME.cancelled!
+  const settled = ownValue(FILE_SEND_OUTCOME, input.outcome) ?? FILE_SEND_OUTCOME.cancelled
   const path = clip(input.path, COMMAND_MAX_CHARS)
   // One line rather than the live card's two rows: a settled card carries no
   // labelled blocks, and the middot is the separator every other context line
@@ -729,32 +793,50 @@ export function questionCard(input: {
   /** The callback payload the submit button carries, for a multiple choice. */
   readonly submit?: object | undefined
 }): object {
+  // Clipped before it becomes card structure, and clipped here rather than at
+  // each layout below so every shape a question can take is bounded once.
+  const options = input.options.slice(0, QUESTION_MAX_OPTIONS).map(option => ({
+    label: clippedText(option.label, QUESTION_OPTION_LABEL_MAX_CHARS),
+    ...option.description === undefined || option.description === ''
+      ? {}
+      : { description: clippedText(option.description, QUESTION_OPTION_DESCRIPTION_MAX_CHARS) },
+  }))
+  const droppedOptions = input.options.length - options.length
+  const question = clip(input.question, QUESTION_MAX_CHARS)
   // Bare labels fit a button row, which is the most obviously clickable shape
   // available; the moment any option needs a sentence to justify it, the whole
   // set becomes rows so the choices stay visually parallel.
-  const explained = input.options.some(
-    option => option.description !== undefined && option.description !== '',
-  )
-  const title = input.header ?? QUESTION.title
+  const explained = options.some(option => option.description !== undefined && option.description !== '')
+  // A header is a title, not content: clipped with an ellipsis rather than with
+  // a notice line of its own, which would sit above the question it introduces.
+  const title: Line = input.header === undefined
+    ? QUESTION.title
+    : clippedText(input.header, QUESTION_HEADER_MAX_CHARS)
   return card('info', isCopy(title) ? title : { zh: title, en: title }, [
     ...heading('info', title, QUESTION.context),
-    line(input.question, SIZE.body, '12px 20px 0px 20px'),
-    ...input.options.length === 0
+    line(question.shown, SIZE.body, '12px 20px 0px 20px'),
+    ...question.hidden === 0
+      ? []
+      : [line(fill(TRUNCATED, String(question.hidden)), SIZE.foot, '2px 20px 0px 20px', 'grey')],
+    ...options.length === 0
       ? []
       : input.multiSelect === true && input.submit !== undefined
-        ? [multipleChoice(input.options, input.submit)]
+        ? [multipleChoice(options, input.submit)]
         : explained
-          ? input.options.map((option, index) => optionRow(option, input.valueFor(index)))
+          ? options.map((option, index) => optionRow(option, input.valueFor(index)))
           // The first option carries the emphasis: by the tool's own convention
           // a recommendation is listed first, so a flat row of identical
           // buttons would throw away a signal the model already gave.
-          : [actions(input.options.map((option, index) => ({
+          : [actions(options.map((option, index) => ({
             label: option.label,
             value: input.valueFor(index),
             kind: index === 0 ? 'primary' as const : 'default' as const,
           })))],
+    ...droppedOptions === 0
+      ? []
+      : [line(fill(QUESTION.droppedOptions, String(droppedOptions)), SIZE.foot, '2px 20px 0px 20px', 'grey')],
     ...footer(
-      input.options.length === 0
+      options.length === 0
         ? QUESTION.replyOnly
         : input.multiSelect === true && input.submit !== undefined
           ? QUESTION.replyWithChoices
@@ -785,13 +867,22 @@ export function settledQuestionCard(input: {
     ? QUESTION.cancelled
     : input.elsewhere === true ? QUESTION.answeredInWeb : QUESTION.answered
   const answer = clip(input.answer ?? '', REASON_MAX_CHARS)
-  const asked = input.header ?? QUESTION.title
+  // Clipped on the same terms as the live card: this is the record of the same
+  // question, and a record that outgrew the platform's card ceiling would leave
+  // the room with nothing at all.
+  const asked: Line = input.header === undefined
+    ? QUESTION.title
+    : clippedText(input.header, QUESTION_HEADER_MAX_CHARS)
+  const question = clip(input.question, QUESTION_MAX_CHARS)
   const summary = isCopy(asked)
     ? join(title, `：${asked.zh}`, `: ${asked.en}`)
     : join(title, `：${asked}`, `: ${asked}`)
   return card(state, summary, [
     ...heading(state, title, asked),
-    line(input.question, SIZE.body, '12px 20px 0px 20px'),
+    line(question.shown, SIZE.body, '12px 20px 0px 20px'),
+    ...question.hidden === 0
+      ? []
+      : [line(fill(TRUNCATED, String(question.hidden)), SIZE.foot, '2px 20px 0px 20px', 'grey')],
     ...input.cancelled === true || input.answer === undefined || input.answer === ''
       ? []
       : [quoted(QUESTION.answer, answer.shown, 'grey-50', answer.hidden)],
@@ -1370,13 +1461,17 @@ export function settledSessionsCard(input: {
  *
  * A whole absolute path in a subtitle is longer than the title, wraps on a
  * phone, and puts the operator's home directory on a group's screen — while
- * the part that identifies the directory is its tail.
+ * the part that identifies the directory is its tail. Split on BOTH separators,
+ * because a Windows path's tail is behind backslashes: a POSIX-only split left
+ * `F:\myProject\deepseek` on the screen in full, login name and all.
  * @param path - the workspace directory.
  * @returns the short form.
  */
 function workspaceLabel(path: string): string {
-  const parts = path.split('/').filter(part => part !== '')
-  return parts.length <= 2 ? path : parts.slice(-2).join('/')
+  const parts = path.split(/[\\/]/).filter(part => part !== '')
+  // The root is never part of the name: `/home/alice` is `alice`, not
+  // `/home/alice`, and `C:\repo` is `repo`.
+  return parts.length <= 2 ? parts[parts.length - 1] ?? path : parts.slice(-2).join('/')
 }
 
 /** Every toast this channel raises, in the languages it raises them. */

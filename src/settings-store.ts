@@ -30,6 +30,12 @@ import { failureDetail } from './format.ts'
 export interface SettingsDescriptorLike {
   readonly ns?: unknown
   readonly value?: unknown
+  /**
+   * The part of that config the USER document supplies, when the host
+   * publishes it. What a deployment injected through its own composition shows
+   * up in `value` but not here, which is the distinction migration needs.
+   */
+  readonly user?: unknown
 }
 
 /** The modern seam: per-row volatile config, written by the row's own id. */
@@ -59,7 +65,14 @@ export interface SettingsBinding {
    * the Loader passed this plugin, so there is nothing to re-read.
    */
   readonly resolved?: unknown
-  /** Whether a managed-state patch can be persisted at all. */
+  /**
+   * Whether a seam exists that can store managed state at all.
+   *
+   * Distinct from what any single write does: a composed seam may still refuse
+   * one patch (and says so when it does). This is the answer to "will `/cd`,
+   * `/model` and the session pointers survive a restart?", which the operator
+   * asks when something was just fixed and cannot read off the chat.
+   */
   readonly durable: boolean
   /**
    * Write one managed-state patch.
@@ -83,6 +96,31 @@ export function entryIdOf(ctx: Context): string | undefined {
   return typeof id === 'string' && id !== '' ? id : undefined
 }
 
+/**
+ * The part of one row's config the USER document supplies, when the host says.
+ *
+ * The modern seam publishes both the effective value and the document's own
+ * contribution, which is the only way to tell a secret a deployment injected
+ * from one this plugin's onboarding wrote: migration must move the second and
+ * leave the first where its owner put it.
+ * @param settings - the composed `settings` service, in whichever generation it is.
+ * @param ns - the row id to read.
+ * @returns the document's contribution, or undefined when the host publishes
+ * none (an older seam) or cannot answer.
+ */
+export function userSectionOf(settings: unknown, ns: string): unknown {
+  const describe = (settings as { describe?: unknown } | null | undefined)?.describe
+  if (typeof describe !== 'function') return undefined
+  try {
+    const rows = describe.call(settings) as readonly SettingsDescriptorLike[] | undefined
+    return rows?.find(row => row.ns === ns)?.user
+  } catch {
+    // A host that will not list its rows leaves migration to its own judgement
+    // rather than guessing which secret is whose.
+    return undefined
+  }
+}
+
 /** Construction options for {@link createSettingsBinding}. */
 export interface SettingsBindingOptions {
   /** The composed `settings` service, in whichever generation it is. */
@@ -100,6 +138,22 @@ export interface SettingsBindingOptions {
 }
 
 /**
+ * The top-level fields this plugin's own schema lets the host write.
+ *
+ * Read from the schema the Loader resolved, which is the same object the host
+ * asks for volatility, so the two can never disagree about what this row owns.
+ * @param schema - this plugin's Config schema, of any generation.
+ * @returns the field names, or undefined when the schema cannot be read.
+ */
+function volatileFields(schema: unknown): ReadonlySet<string> | undefined {
+  const dict = (schema as { dict?: Record<string, { meta?: { volatile?: boolean } }> } | null | undefined)?.dict
+  if (dict === undefined || dict === null) return undefined
+  return new Set(Object.entries(dict)
+    .filter(([, field]) => field.meta?.volatile === true)
+    .map(([name]) => name))
+}
+
+/**
  * Bind this channel's managed state to the settings seam a deployment composed.
  * @param options - the service, the row identity, and the schema to register.
  * @returns the binding, whose `persist` is a no-op when nothing can store.
@@ -107,11 +161,34 @@ export interface SettingsBindingOptions {
 export function createSettingsBinding(options: SettingsBindingOptions): SettingsBinding {
   const { settings, entryId, namespace, schema, base, report } = options
   const noStore = (reason: string): SettingsBinding => {
-    report(`lark-channel: ${reason} — /cd workspaces, /model routes, session picks and epochs live in memory only`)
+    report(`lark-channel: ${reason} — /cd workspaces, /model routes and session pointers live in memory only`)
     return { durable: false, persist: async () => false }
   }
   if (settings === undefined || settings === null) {
     return noStore('no settings service is composed')
+  }
+
+  const owned = volatileFields(schema)
+  let reportedStray = false
+  /**
+   * Narrow one patch to the fields this row declares.
+   *
+   * A host that validates refuses the WHOLE patch over a single undeclared key
+   * — which is how a registration once lost the credentials it had just
+   * created, because it also reported who scanned the code. Dropping the stray
+   * key keeps the state that matters, and saying so keeps the mistake visible
+   * instead of silently costing a write.
+   */
+  const ownFields = (patch: object): object => {
+    if (owned === undefined) return patch
+    const stray = Object.keys(patch).filter(key => !owned.has(key))
+    if (stray.length === 0) return patch
+    if (!reportedStray) {
+      reportedStray = true
+      report(`lark-channel: not persisting undeclared field(s) ${stray.join(', ')}; `
+        + `this row writes ${[...owned].join(', ')}`)
+    }
+    return Object.fromEntries(Object.entries(patch).filter(([key]) => owned.has(key)))
   }
 
   const modern = settings as Partial<ModernSettings>
@@ -121,8 +198,11 @@ export function createSettingsBinding(options: SettingsBindingOptions): Settings
     return {
       durable: true,
       async persist(patch) {
+        const fields = ownFields(patch)
+        // Everything was stray: there is nothing this row may write.
+        if (Object.keys(fields).length === 0) return false
         try {
-          await update(entryId, patch)
+          await update(entryId, fields)
           return true
         } catch (error: unknown) {
           // Said once, with the host's own words: "not volatile" and "overridden
@@ -148,8 +228,11 @@ export function createSettingsBinding(options: SettingsBindingOptions): Settings
         resolved: scope.get(),
         durable: true,
         async persist(patch) {
+          const fields = ownFields(patch)
+          // Everything was stray: there is nothing this row may write.
+          if (Object.keys(fields).length === 0) return false
           try {
-            await scope.update(patch)
+            await scope.update(fields)
             return true
           } catch (error: unknown) {
             if (!refused) {
@@ -163,6 +246,14 @@ export function createSettingsBinding(options: SettingsBindingOptions): Settings
     } catch (error: unknown) {
       return noStore(`registering the settings namespace "${namespace}" failed: ${failureDetail(error)}`)
     }
+  }
+
+  // A modern service with no row id to name: the write path exists but this
+  // deployment gives the plugin row no `id:`, so no patch can be addressed.
+  // Said in those words rather than "offers neither seam", because the operator
+  // fix is to name the row, not to change hosts.
+  if (typeof modern.update === 'function') {
+    return noStore('the settings service writes by Loader row id, and this deployment names none for this plugin')
   }
 
   return noStore("this host's settings service offers neither update() nor register()")

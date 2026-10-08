@@ -9,6 +9,7 @@ import type { CardActionEvent, NormalizedMessage, SendOptions } from '@larksuite
 import * as plugin from '../src/index.ts'
 import { GET_COMMAND, SEND_FILE_TOOL } from '../src/outbound-file.ts'
 import { QUESTION_TIMEOUT_MS, questionActionValue } from '../src/questions.ts'
+import { configuredAppId } from '../src/onboarding.ts'
 import { parseRoute } from '../src/model.ts'
 import * as invariant from '../src/invariant.ts'
 import type { HostApprovalOutcome, HostApprovalRequest, HostUserQuestionAnswer, HostUserQuestionRequest } from '../src/host.ts'
@@ -38,6 +39,20 @@ import { denyRead, READ_DENIED_CODE } from './platform.ts'
 
 /** Directories these tests let the channel write into, removed after each one. */
 const workspaces: string[] = []
+
+/**
+ * The session pointer one settings store was last asked to record.
+ * @param updates - every patch the fake settings service received, in order.
+ * @returns the anchor and session id of the newest `chatSessions` entry.
+ */
+function lastPointer(updates: readonly object[]): { anchor: string; sessionId: string } | undefined {
+  for (let index = updates.length - 1; index >= 0; index -= 1) {
+    const section = (updates[index] as { chatSessions?: Record<string, string> }).chatSessions
+    const entry = section === undefined ? undefined : Object.entries(section).at(-1)
+    if (entry !== undefined) return { anchor: entry[0], sessionId: entry[1] }
+  }
+  return undefined
+}
 
 afterEach(async () => {
   for (const workspace of workspaces.splice(0)) await rm(workspace, { recursive: true, force: true })
@@ -390,6 +405,63 @@ describe('dsh-lark-channel', () => {
     expect(harness.fake.state.disconnects).toBe(1)
     expect(harness.fake.state.subscriptions).toBe(0)
     expect(harness.agents.created[0]!.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports a bridge that failed to install, and closes the transport', async () => {
+    // The failure that muted a real deployment: the transport connected, the
+    // bridge threw while installing, and nothing was left to read a message.
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-lark-InstallFail-'))
+    const diagnosticsFile = join(directory, 'diagnostics.log')
+    const harness = await mountChannel({ diagnosticsFile }, { failInstall: true })
+    await vi.waitFor(() => {
+      expect(harness.notices.some(line => line.includes('installing the bridge failed'))).toBe(true)
+    })
+    // Closed rather than left connected with no handlers: a zombie transport
+    // swallows every message and looks exactly like being offline.
+    expect(harness.fake.state.disconnects).toBe(1)
+    // And it is not reported as a registration failure, which is what a caller
+    // that was onboarding would otherwise say.
+    expect(harness.notices.some(line => line.includes('应用注册失败'))).toBe(false)
+    // The stack reaches the file as well as the console: this happens once, in a
+    // process whose console is usually gone by the time anyone asks which line
+    // threw — and a deployment may compose no logger printer at all.
+    await vi.waitFor(async () => {
+      expect(await readFile(diagnosticsFile, 'utf8')).toContain('installing the bridge failed')
+    })
+    const written = await readFile(diagnosticsFile, 'utf8')
+    expect(written).toContain('the transport refused a handler')
+    // A frame from the throw site, which is what names the line.
+    expect(written).toContain('harness.ts')
+    await harness.dispose()
+    await rm(directory, { recursive: true, force: true })
+  })
+
+  it('says where the credentials came from and whether managed state is durable', async () => {
+    // "It works now" answers neither question an operator asks next, so the line
+    // that announces the connection answers both.
+    const vault = createFakeCredentials({ LARK_APP_SECRET: 'vault-secret' })
+    const reference = await mountChannel(
+      { appId: 'cli_ref', appSecret: undefined, appSecretRef: 'LARK_APP_SECRET' },
+      { credentials: vault.credentials },
+    )
+    await vi.waitFor(() => { expect(reference.fake.state.connects).toBe(1) })
+    const fromReference = reference.notices.find(line => line.includes('已连接')) ?? ''
+    expect(fromReference).toContain('cli_ref')
+    expect(fromReference).toContain('密钥来自凭据 LARK_APP_SECRET')
+    // No settings service was composed for this mount, so nothing is durable.
+    expect(fromReference).toContain('仅本次进程')
+    await reference.dispose()
+
+    const store = createFakeSettings()
+    const inline = await mountChannel(
+      { appId: 'cli_inline', appSecret: 'inline-secret' },
+      { settings: store.settings },
+    )
+    await vi.waitFor(() => { expect(inline.fake.state.connects).toBe(1) })
+    const fromInline = inline.notices.find(line => line.includes('已连接')) ?? ''
+    expect(fromInline).toContain('密钥来自内联配置')
+    expect(fromInline).toContain('已持久化')
+    await inline.dispose()
   })
 
   describe('agent composition', () => {
@@ -1340,7 +1412,7 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('serves /get in a group with no card at all, and spends no agent on it', async () => {
+    it('asks the group before /get puts bytes in it, and sends once the room allows', async () => {
       const { workspace, contents } = await workspaceWithArtifact()
       const harness = await mountChannel({ cwd: workspace })
       await harness.fake.emitMessage(fakeMessage({
@@ -1348,17 +1420,43 @@ describe('dsh-lark-channel', () => {
         chatId: 'oc_group_1',
         content: `/${GET_COMMAND} report.md`,
       }))
-      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
 
-      // A human typing the path has stated his intent; approving his own
-      // command is theatre, group or not (ADR 0002).
-      expect(cardsSent(harness)).toHaveLength(0)
+      // The room is asked, the file is named in words, and nothing leaves yet.
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      expect(filesSent(harness)).toHaveLength(0)
+      expect(sentText(harness)).toContain('report.md')
+      // The command still spends no agent on itself.
       expect(harness.agents.created).toHaveLength(0)
+
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!)
+        .find((value) => value.decision === 'allow')!
+      await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1' }))
+
+      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
       const [sent] = filesSent(harness)
       expect(sent?.to).toBe('oc_group_1')
       expect(sent?.opts?.replyTo).toBe('om_in_1')
       expect(sent?.file.fileName).toBe('report.md')
       expect((sent!.file.source as Buffer).toString('utf8')).toBe(contents)
+      await harness.dispose()
+    })
+
+    it('sends a group /get nothing when the room refuses it', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      await harness.fake.emitMessage(fakeMessage({
+        chatType: 'group',
+        chatId: 'oc_group_1',
+        content: `/${GET_COMMAND} report.md`,
+      }))
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+
+      const reject = approvalValueFromCard(cardsSent(harness)[0]!)
+        .find((value) => value.decision === 'reject')!
+      await harness.fake.emitCardAction(clickAction(reject, { chatId: 'oc_group_1' }))
+
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('拒绝') })
+      expect(filesSent(harness)).toHaveLength(0)
       await harness.dispose()
     })
 
@@ -2200,6 +2298,22 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('ignores an inline secret that is not a string, so the reference still resolves', async () => {
+      // A deployment deriving the secret from an unset environment variable hands
+      // the plugin a non-string rather than `undefined`; the reference is where
+      // the real secret is, and returning the other value would hide it.
+      const store = createFakeSettings({ appId: 'cli_ref', appSecret: null }, { legacy: true })
+      const vault = createFakeCredentials({ LARK_APP_SECRET: 'vault-secret' })
+      const harness = await mountChannel(
+        { appId: undefined, appSecret: undefined },
+        { settings: store.settings, credentials: vault.credentials },
+      )
+      await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
+      expect(harness.portConfigs[0]!.appSecret).toBe('vault-secret')
+      expect(store.updates).toEqual([])
+      await harness.dispose()
+    })
+
     it('reports who registered the app without authorizing on it', async () => {
       const store = createFakeSettings()
       const harness = await mountChannel(
@@ -2214,9 +2328,13 @@ describe('dsh-lark-channel', () => {
         },
       )
       await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
-      expect(store.updates).toEqual([
-        { appId: 'cli_new', appSecret: 'new-secret', registeredBy: 'ou_scanner' },
-      ])
+      // The scanner is named in the notice, not in the stored patch: this row
+      // has no `registeredBy` field, and a host that validates refuses the whole
+      // patch over one undeclared key — taking the credentials with it.
+      expect(store.updates).toEqual([{ appId: 'cli_new', appSecret: 'new-secret' }])
+      expect(harness.notices.some(line => line.includes('ou_scanner'))).toBe(true)
+      // And the credentials it just created are durable, not this process's only.
+      expect(harness.notices.some(line => line.includes('凭证仅本次进程有效'))).toBe(false)
       // Recorded for reference; it narrows nothing on its own.
       expect(harness.portAuthorizations[0]!.directSenders).toEqual([])
       await harness.dispose()
@@ -2378,6 +2496,41 @@ describe('dsh-lark-channel', () => {
       expect(store.written[0]!.ns).toBe('lark-channel')
       expect(store.updates).toEqual([{ appId: 'cli_new', appSecret: 'new-secret' }])
       await harness.dispose()
+    })
+
+    it('treats an unusable configured app id as none, so the scan still starts', async () => {
+      // The field case: the deployment's appId came from an unset environment
+      // variable, so it resolved to a non-string. The registration flow refuses
+      // anything but a non-empty string, which turned "no app configured" into
+      // "registration failed" instead of the code that creates one.
+      const requests: RegisterAppRequest[] = []
+      const store = createFakeSettings({ appId: null, appSecret: 'stored-secret' }, { legacy: true })
+      const harness = await mountChannel(
+        { appId: undefined, appSecret: undefined },
+        {
+          settings: store.settings,
+          registerApp: async (request) => {
+            requests.push(request)
+            request.onQRCodeReady({ url: 'https://example.local/qr', expireIn: 600 })
+            return { client_id: 'cli_new', client_secret: 'new-secret' }
+          },
+        },
+      )
+      await vi.waitFor(() => { expect(requests).toHaveLength(1) })
+      // Nothing is handed over, so the flow cannot reject the value.
+      expect(requests[0]).not.toHaveProperty('appId')
+      expect(harness.notices.some(line => line.includes('https://example.local/qr'))).toBe(true)
+      expect(harness.notices.some(line => line.includes('应用注册失败'))).toBe(false)
+      await harness.dispose()
+    })
+
+    it('accepts only a non-empty string as a configured app id', () => {
+      expect(configuredAppId('cli_1')).toBe('cli_1')
+      expect(configuredAppId('')).toBeUndefined()
+      expect(configuredAppId(undefined)).toBeUndefined()
+      expect(configuredAppId(null)).toBeUndefined()
+      expect(configuredAppId(42)).toBeUndefined()
+      expect(configuredAppId({ appId: 'cli_1' })).toBeUndefined()
     })
 
     it('uses credentials stored in settings without re-registering', async () => {
@@ -3229,7 +3382,9 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
       await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
-      expect(harness.agents.created[1]!.sessionId).toBe('lark-oc_chat_1--e1')
+      // The switch lands on the session `/new` minted, not the one it left.
+      expect(harness.agents.created[1]!.sessionId).toMatch(/^lark-oc_chat_1--s[0-9a-f]{8}$/)
+      expect(harness.agents.created[1]!.sessionId).not.toBe(harness.agents.created[0]!.sessionId)
 
       await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
       await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
@@ -3316,7 +3471,8 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
       // Opened for the switch, on the session the conversation resolves to now.
       expect(harness.agents.created).toHaveLength(2)
-      expect(harness.agents.created[1]!.sessionId).toBe('lark-oc_chat_1--e1')
+      expect(harness.agents.created[1]!.sessionId).toMatch(/^lark-oc_chat_1--s[0-9a-f]{8}$/)
+      expect(harness.agents.created[1]!.sessionId).not.toBe(harness.agents.created[0]!.sessionId)
       await harness.dispose()
     })
 
@@ -3750,7 +3906,7 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('/cd ends a pick when it moves, and leaves it alone when it does not', async () => {
+    it('/cd moves to the other directory own thread, and back to the one it left', async () => {
       const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-pick-')))
       const { query } = createFakeSessionQuery([
         {
@@ -3774,8 +3930,9 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: 'still here' }))
       await vi.waitFor(() => { expect(harness.agents.resumed).toContain('session-web-ui') })
 
-      // A `/cd` that moves ends the pick, because the picked session belongs to
-      // the directory this conversation just left.
+      // A `/cd` that moves enters another directory's thread: the pointer belongs
+      // to the directory it was recorded in, so it does not follow the chat —
+      // and it is not thrown away either, which is what makes the way back work.
       await harness.fake.emitMessage(fakeMessage({ content: `/cd ${target}` }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('已切换到') })
       const before = harness.agents.resumed.length
@@ -3783,10 +3940,18 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(harness.agents.created.length).toBeGreaterThan(1) })
       expect(harness.agents.resumed.slice(before)).not.toContain('session-web-ui')
       expect(harness.agents.created.at(-1)!.meta?.cwd).toBe(target)
+
+      // And the way back returns to the session that directory was left on.
+      await harness.fake.emitMessage(fakeMessage({ content: `/cd ${process.cwd()}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切换到') })
+      const resumedBefore = harness.agents.resumed.length
+      await harness.fake.emitMessage(fakeMessage({ content: 'back again' }))
+      await vi.waitFor(() => { expect(harness.agents.resumed.length).toBeGreaterThan(resumedBefore) })
+      expect(harness.agents.resumed.at(-1)).toBe('session-web-ui')
       await harness.dispose()
     })
 
-    it('runs /new: a fresh session id, the old agent released, settings kept', async () => {
+    it('runs /new: a minted session id, the old agent released, settings kept', async () => {
       const store = createFakeSettings()
       const harness = await mountChannel({}, { settings: store.settings })
       await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
@@ -3797,22 +3962,26 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
       // No agent is built to answer the command itself.
       expect(harness.agents.created).toHaveLength(1)
-      expect(store.updates).toContainEqual({ chatEpochs: { 'lark-oc_chat_1': '1' } })
+      // What moved is the pointer, and it names an id this conversation never
+      // ran: nothing was counted, so nothing can be handed back twice.
+      const pointer = lastPointer(store.updates)
+      expect(pointer?.anchor).toBe('lark-oc_chat_1')
+      expect(pointer?.sessionId).toMatch(/^lark-oc_chat_1--s[0-9a-f]{8}$/)
+      expect(store.updates.some(update => 'chatEpochs' in update)).toBe(false)
 
       await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
       // A different session, so the context starts empty — and the first one
       // is still on disk, merely not what this conversation resolves to.
-      expect(harness.agents.created[1]!.sessionId).toBe('lark-oc_chat_1--e1')
+      expect(harness.agents.created[1]!.sessionId).toBe(pointer!.sessionId)
       await harness.dispose()
     })
 
     it('runs /new for a conversation that runs in an overridden workspace', async () => {
       // The deployment in the field runs the chat in a directory that is not
-      // the process default, so its derived id carries a workspace digest and
-      // the epoch is keyed by that longer base id. The digest must survive the
-      // epoch fold: dropping it would move the conversation to the default
-      // directory's session instead of starting it over where it is.
+      // the process default, so its derived id carries a workspace digest. The
+      // digest must survive the mint: dropping it would move the conversation to
+      // the default directory's session instead of starting it over where it is.
       const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-new-')))
       const store = createFakeSettings()
       const harness = await mountChannel(
@@ -3828,22 +3997,22 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
       expect(harness.agents.created).toHaveLength(1)
-      expect(store.updates).toContainEqual({ chatEpochs: { [base]: '1' } })
+      const pointer = lastPointer(store.updates)
+      expect(pointer?.anchor).toBe(base)
+      expect(pointer?.sessionId.startsWith(`${base}--s`)).toBe(true)
 
       await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
-      expect(harness.agents.created[1]!.sessionId).toBe(`${base}--e1`)
+      expect(harness.agents.created[1]!.sessionId).toBe(pointer!.sessionId)
       await harness.dispose()
     })
 
-    it('restores an archived session before starting it', async () => {
-      // The reported field case: the conversation's own session was archived in
-      // the host, and the person then typed `/new` to start over. The epoch
-      // moves the derivation, but the host's archived-session gate rejects every
-      // step of an archived id — so the next message would be answered by
-      // nothing. The rung that creates the session is the only place the id is
-      // reachable again, so it lifts the archive there.
-      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-')))
+    it('starts a fresh session even when the conversation own session is archived', async () => {
+      // The reported field case: the session this conversation derives was
+      // archived in the host, and the person then typed `/new`. A counter handed
+      // that same archived id straight back — so the next message was refused by
+      // the host's gate and answered by nothing. A minted id cannot be archived.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-new-')))
       const store = createFakeSettings()
       const first = createFakeWorkspaces()
       const harness = await mountChannel(
@@ -3853,20 +4022,65 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
       const base = harness.agents.created[0]!.sessionId
+      first.service.archivedSessionIds = [base]
 
-      // Archived from now on, which is what the host reports per derivation.
-      first.service.archivedSessionIds = [base, `${base}--e1`]
       await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      const started = lastPointer(store.updates)!.sessionId
+      expect(started).not.toBe(base)
+      expect(first.service.archivedSessionIds).not.toContain(started)
 
       await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
-      const started = harness.agents.created[1]!.sessionId
-      expect(started).toBe(`${base}--e1`)
-      // The archive was lifted for the id that is about to run, so the host's
-      // gate lets its first step through.
-      expect(first.unarchived).toContain(started)
-      expect(first.service.archivedSessionIds).not.toContain(started)
+      expect(harness.agents.created[1]!.sessionId).toBe(started)
+      expect(sentText(harness)).not.toContain('已被归档')
+      await harness.dispose()
+    })
+
+    it('refuses an archived session in the chat instead of restoring it', async () => {
+      // An archived session must not run until its owner restores it, and the
+      // host enforces that by rejecting every step it proposes. Lifting the
+      // archive here would overrule that decision silently — and a refusal that
+      // creates an agent anyway would write over the session it just refused.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-refuse-')))
+      const store = createFakeSettings()
+      const first = createFakeWorkspaces()
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { settings: store.settings, workspaces: first.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      const started = lastPointer(store.updates)!.sessionId
+      // Archived before it is ever opened, which is what the host reports.
+      first.service.archivedSessionIds = [started]
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已被归档') })
+      expect(first.unarchived).toEqual([])
+      expect(harness.agents.created.some(agent => agent.sessionId === started)).toBe(false)
+      await harness.dispose()
+    })
+
+    it('adopts a pointer stored against the bare conversation key', async () => {
+      // Before the pointer was keyed by anchor, `/sessions` recorded it against
+      // the conversation key and `/cd` cleared it. The stored session must still
+      // decide what the conversation continues, and the entry must move — which
+      // is what stops it from following the chat into another directory.
+      const store = createFakeSettings()
+      const harness = await mountChannel(
+        { chatSessions: { oc_chat_1: 'session-web-ui' } },
+        { settings: store.settings, workspaces: createFakeWorkspaces().service },
+      )
+      harness.agents.resumable.add('session-web-ui')
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('session-web-ui') })
+      await vi.waitFor(() => { expect(store.updates).toContainEqual({ chatSessions: { 'lark-oc_chat_1': 'session-web-ui' } }) })
+      await vi.waitFor(() => { expect(store.updates).toContainEqual({ chatSessions: { oc_chat_1: '' } }) })
       await harness.dispose()
     })
 
@@ -3893,6 +4107,21 @@ describe('dsh-lark-channel', () => {
       })
       await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('空闲') })
+      await harness.dispose()
+    })
+
+    it('reports a minted session as not created yet, not as a continuation', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      // The fresh session does not exist yet: `/status` must not claim the chat
+      // is continuing something.
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('尚未创建') })
+      expect(sentText(harness)).not.toContain('已接续会话')
       await harness.dispose()
     })
 

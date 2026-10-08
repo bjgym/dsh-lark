@@ -111,8 +111,8 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 
 | Capability | What you get |
 |---|---|
-| Durable sessions | Survive a restart; the next message continues where you were, and `/new` starts over in place |
-| Continue a session | `/sessions` pages through what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; a card accepts one pick, so switching again means sending `/sessions` again; `/cd` and `/new` return it to the derived session. Once it is on a session the chat also shows that session's output, a web-UI turn included, and **switching away stops it**: the chat mirrors only the session it is on, while the one it leaves stays with whoever was running it |
+| Durable sessions | Survive a restart; the next message continues where you were, and `/new` starts over in place on a brand-new session id |
+| Continue a session | `/sessions` pages through what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; a card accepts one pick, so switching again means sending `/sessions` again; `/cd` enters the session that other directory was left on (each directory remembers its own, and coming back returns to it), while `/new` mints a fresh one. Once it is on a session the chat also shows that session's output, a web-UI turn included, and **switching away stops it**: the chat mirrors only the session it is on, while the one it leaves stays with whoever was running it |
 | Workspaces | `/ws` opens a workspace picker where one press switches; `/cd` switches directly by name or path; returning to one resumes the work you left there |
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
@@ -159,13 +159,13 @@ The card is still sent and the two surfaces still race; when the web answers fir
 | `/status` | Show and refresh workspace, model, and session; context and tokens where available |
 | `/ws` | Open the workspace picker; one press switches |
 | `/cd <name or path>` | Switch this conversation's workspace |
-| `/get <path>` | Send a workspace file to the chat |
+| `/get <path>` | Send a workspace file to the chat; in a group it asks the room first, and the bytes leave only after someone allows it |
 | `/model` | Open the model picker |
 | `/model use <provider/model>` | Switch without opening a card |
 | `/model reset` | Back to the deployment default |
 | `/permission` | Open the permission-preset picker |
 | `/permission <preset>` | Switch preset without opening a card |
-| `/new` | Start a fresh session in place; workspace and model stay, and a session archived earlier is restored before it starts |
+| `/new` | Start a fresh session in place; workspace and model stay. Its id is minted on the spot, so it can never be one this conversation already ran; an archived session is neither revived nor silently overwritten |
 | `/sessions` | Page through the sessions this conversation may continue, one press each; a card accepts one pick |
 | `/sessions <keyword>` | Filter that list by title or id |
 | `/stop` | Stop the running task |
@@ -232,13 +232,15 @@ dsh web
 - Image input is off by default: turn on `attachImages` only for a model you know accepts images.
 - `receiveFiles` is on by default: inbound files land under `.dsh-lark/inbox/<timestamp>-<message hash>/` in the conversation's workspace and are never cleaned up automatically — that's on you. The first file into a workspace prompts a suggestion to add `.dsh-lark/` to `.gitignore`, but the channel never edits that file itself.
 - `sendFiles` is on by default too: a direct message sends straight through, a group shows an approval card on every send — carrying where the file sits inside the workspace, the workspace's own name, and the size, rather than an absolute host path everyone in the room would read. There is no setting to turn that group approval off, since it would be an official back door for a prompt-injection exfiltration chain.
+- `/get` goes through the same check `send_file` does, so in a group it asks the room first too: the only difference between them is who started it, and what a group guards against is a file entering the room rather than who wanted it there. One person approving their own command is not theatre in a group — it is the boundary itself.
 - An outbound file is only ever named by where it sits inside the workspace. No absolute host prefix reaches anything a person or the model reads — including the filesystem's own message when a read fails, both in the `/get` reply and in what `send_file` tells the model. The failure branch is precisely the one a prompt injection can provoke on purpose.
 - One group holds at most three files awaiting a decision. A group send reads the whole file into memory before the room is asked, so that what the room approves is the artifact that leaves — which means the number of undecided sends has to be bounded. A fourth is refused outright and the model is told to wait for the standing ones. The number is not configurable: raising it buys back the memory risk and the approval fatigue together.
 - Settled approval cards record who decided: when the callback omits a name, the channel best-effort resolves it from the current chat roster. Missing roster permission, lookup failures, or departed members safely show the open id instead and never block approval or file delivery.
 - The single-file ceiling defaults to 20 MiB, set separately for each direction with `maxReceiveFileBytes` and `maxSendFileBytes`; documents (pdf / xlsx / docx) only ever arrive as a download with no online preview, because the upstream SDK uploads every general file as the `stream` type instead of inferring one from the extension.
 - Voice messages land on disk like any other file; nothing transcribes them.
 - Diagnostics reach the process terminal by default; name `diagnosticsFile` and this channel appends them to that file instead (a path with an extension is the file, anything else is a directory that holds `dsh-lark-diagnostics.log`), with `diagnosticsLevel` as the floor (default `warn`; `debug`/`info`/`warn`/`error`). `diagnoseSessions` is off by default and, when on, reports which candidate `/sessions` admitted or withheld, under which rule, plus the counts at each stage — the line count scales with the withheld records, which is what makes a short list attributable.
-- Configuration is read at startup; changing it needs a restart.
+- Configuration is read at startup; changing it needs a restart. A workspace switch, a model switch, the session pointer (`/sessions` or `/new` wrote it) and a scanned credential are written back through the host's settings service and survive the restart; the schema fields carrying them are marked volatile, which is the condition the host requires before it will write at all — without the marking it refuses, and the channel would only remember them in memory while looking as if it had persisted them. A failed write now reaches both the console and `diagnosticsFile` instead of flashing past in a terminal. The older `chatEpochs` field is kept read-only: a conversation running on `--e<N>` still resumes, but nothing writes it any more.
+- A rotated App Secret takes effect on restart: the channel hears the host's credentials event and re-resolves the reference, but the connection already built keeps the secret it was constructed with, so restart the service after changing one.
 
 </details>
 

@@ -51,8 +51,8 @@ import {
   IconEditOutlineRegular, MarkdownText, StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { HostObservable, InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { AnswerableQuestion, QuestionAnswerItem, QuestionCardState, QuestionFace, QuestionSpec, QuestionTarget } from './question-store.ts'
-import { answerBatchOf, asPendingQuestion, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion } from './question-store.ts'
+import type { AnswerableQuestion, QuestionAnswerItem, QuestionCardState, QuestionFace, QuestionSpec, QuestionTarget, SubmissionGuard } from './question-store.ts'
+import { answerBatchOf, asPendingQuestion, createSubmissionGuard, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion } from './question-store.ts'
 import type { QuestionDraftAnswer, QuestionDraftProgress, QuestionDraftsFace } from './question-drafts.ts'
 import type { SettledQuestion } from './question-decisions.ts'
 import type { SessionStatusSnapshot, UseSessionStatus } from '@deepseek-ai/dsh-client-ui-session/client'
@@ -325,15 +325,14 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   /** Whether this mount already recorded the elsewhere answer. */
   const retired = useRef(false)
   /**
-   * Whether a submission is in flight.
+   * This mount's in-flight submission, created once.
    *
-   * A ref rather than the `busy` state: two activations can land in one batch —
-   * an option row's Enter plus the submit button, or a key repeat — before a
-   * re-render disables either control, and the second would submit the same
-   * batch again. The shipped class rejects the duplicate, and that rejection
-   * would surface to the user as a raw failure on an answer that did land.
+   * The guard holds both halves of the panel's submit discipline: one submission
+   * at a time, and the re-arm that releases it when a dropped waterfall answer
+   * leaves the draft to be sent again. See {@link SubmissionGuard}.
    */
-  const submitting = useRef(false)
+  const submission = useRef<SubmissionGuard | undefined>(undefined)
+  const guard = (submission.current ??= createSubmissionGuard())
   useEffect(() => {
     active.current = true
     return () => { active.current = false }
@@ -382,9 +381,16 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   useEffect(() => {
     if (sentVia.current !== 'waterfall' || card.state !== 'continued') return
     sentVia.current = null
+    // The guard is released with the controls it guards: a waterfall submission
+    // that resolved was still dropped, and this re-arm is the panel asking for
+    // the same draft again — a guard left set would make the button it just
+    // enabled do nothing at all, silently. Releasing it retires the token of the
+    // dropped submission, so whatever that one reports later cannot clear or
+    // block the retry this re-arm admits.
+    guard.rearm()
     setBusy(null)
     setError({ key: 'error.resubmit' })
-  }, [card.state])
+  }, [card.state, guard])
 
   // The countdown belongs to the carrier, not to this component: the user can
   // hide the panel and reopen it from the tool call row, and a timer that died
@@ -518,18 +524,21 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   const completed = (item: QuestionDraftAnswer): boolean => answered(item) || item.skipped
 
   const submitDrafts = (values: QuestionDraftAnswer[]): void => {
-    if (pending === undefined || submitting.current) return
+    if (pending === undefined) return
+    const token = guard.begin()
+    if (token === undefined) return
     const missing = values.findIndex(item => !completed(item))
     if (missing >= 0) {
+      guard.finish(token)
       replaceProgress(missing, values)
       setError({ key: 'error.incomplete' })
       return
     }
     if (!canSubmit) {
+      guard.finish(token)
       setError({ key: 'error.unavailable' })
       return
     }
-    submitting.current = true
     setBusy('answer')
     setError(null)
     // The external-store render can lag the carrier as a timed call continues.
@@ -538,6 +547,9 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
     sentVia.current = channel === 'waterfall' ? 'waterfall' : null
     void pending.answer(answerBatchOf(questions, values))
       .then(() => {
+        // A re-armed panel has already moved on: this outcome belongs to a
+        // submission the retry replaced, so it neither paints nor dismisses.
+        if (!guard.owns(token)) return
         if (channel !== 'rpc') return
         sentVia.current = null
         setBusy(null)
@@ -545,7 +557,9 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
         void pending.dismiss?.().catch(() => { setError({ key: 'status.sent' }) })
       })
       .catch((cause: unknown) => {
-        submitting.current = false
+        // Only the submission that still owns the guard reports a failure; the
+        // one a re-arm retired was dropped, and its rejection is not the retry's.
+        if (!guard.finish(token)) return
         if (!active.current) return
         sentVia.current = null
         setBusy(null)

@@ -26,10 +26,10 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
-import { delimiter, dirname, join, resolve, sep } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { ownVersion } from './version.ts'
 import { instanceIdentity, refuseInstanceName } from './instance.ts'
@@ -72,11 +72,27 @@ allowBuilds:
 /** The value pnpm parks under `allowBuilds` for a script nobody has judged yet. */
 const PNPM_BUILD_PLACEHOLDER = 'set this to true or false'
 
-/** A top-level key line, which is also where any `allowBuilds` block ends. */
+/**
+ * A top-level key line, which is also where any `allowBuilds` block ends.
+ *
+ * Anchored at column zero on purpose: this is what tells the block parser that a
+ * nested entry's indented `protobufjs:` does not end the block. The reader that
+ * has to tolerate indentation is {@link hasCredentialSection}, and it does so on
+ * its own.
+ */
 const TOP_LEVEL_KEY = /^([A-Za-z_][\w-]*)\s*:(.*)$/
 
 /** One package's decision inside an `allowBuilds` block. */
 const ALLOW_BUILDS_ENTRY = /^(\s+protobufjs\s*:\s*)(.*)$/
+
+/**
+ * What a profile name may contain.
+ *
+ * Stricter than the host's own rule, because this CLI turns the name into a path
+ * component, a unit-file value and a command-line token — see
+ * {@link refuseProfileName}.
+ */
+const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
 /** What the operator asked for, after argument parsing. */
 export type Command =
@@ -123,7 +139,10 @@ export interface ServiceSpec {
  * @returns the command prefix to print.
  */
 export function invocation(scriptPath: string = process.argv[1] ?? ''): string {
-  return scriptPath.includes(`${sep}_npx${sep}`) ? 'npx dsh-lark-channel@latest' : 'dsh-lark-channel'
+  // Either separator, rather than this platform's `sep`: the answer only has to
+  // be right about where the script came from, and a path handed in by a test,
+  // a wrapper or a symlink chain is not obliged to be spelled with `sep`.
+  return /[/\\]_npx[/\\]/.test(scriptPath) ? 'npx dsh-lark-channel@latest' : 'dsh-lark-channel'
 }
 
 /** Usage text, spelled for the way this process was started. */
@@ -321,7 +340,11 @@ export function unitPath(platform: NodeJS.Platform = process.platform): string {
  * @returns true when the section is present.
  */
 export function hasCredentialSection(document: string, namespace: string = ROW_ID): boolean {
-  return new RegExp(`^${namespace}\\s*:`, 'm').test(document)
+  // Indentation and a quoted key are both ordinary YAML spellings of the same
+  // top-level section, and a document carrying either is onboarded: reading only
+  // the column-zero unquoted form sent an already-onboarded bot back to the QR
+  // flow for ten minutes.
+  return new RegExp(`^\\s*['"]?${namespace}['"]?\\s*:`, 'm').test(document)
 }
 
 /**
@@ -383,18 +406,42 @@ function serviceEnvironment(spec: ServiceSpec): ReadonlyArray<readonly [string, 
   return variables
 }
 
-/** Escape a value for a plist text node, where a bare `&` or `<` breaks the XML. */
+/**
+ * Escape a value for a plist text node, where a bare `&` or `<` breaks the XML. */
 function xmlEscape(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 }
 
 /**
+ * One unit value's literal text: specifiers escaped, one line only.
+ *
+ * `%` is systemd's specifier sigil (`%i`, `%n`, `%h`…), so a path or a secret
+ * carrying one has to be doubled or systemd substitutes something else for it.
+ * A line break cannot be expressed at all — a unit file is line-oriented, and a
+ * value carrying one would end its own line and start a directive — so it is
+ * refused rather than silently split into two.
+ * @param value - the text to place in a unit line.
+ * @param what - what the value is, for the refusal message.
+ * @returns the text with literal `%` doubled.
+ * @throws when the value carries a line break.
+ */
+function systemdLiteral(value: string, what: string): string {
+  if (/[\r\n]/.test(value)) {
+    throw new Error(`the ${what} carries a line break, which a systemd unit file cannot express`)
+  }
+  return value.replaceAll('%', '%%')
+}
+
+/**
  * Quote a value for a systemd unit. `Environment=` takes a space-separated list
  * of assignments — a PATH with a space in it (Visual Studio Code's directory,
- * routinely) shears apart without this — and `ExecStart` tokenizes the same way.
+ * routinely) shears apart without this — and `ExecStart`, `WorkingDirectory` and
+ * the output paths tokenize the same way.
+ * @param value - the value to quote.
+ * @returns the quoted value, specifiers escaped.
  */
 function systemdQuote(value: string): string {
-  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
+  return `"${systemdLiteral(value, 'value').replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
 /**
@@ -444,14 +491,14 @@ export function systemdUnit(spec: ServiceSpec): string {
     .map(([key, value]) => `Environment=${systemdQuote(`${key}=${value}`)}\n`)
     .join('')
   return `[Unit]
-Description=dsh-lark-channel (profile ${spec.profile})
+Description=${systemdLiteral(`dsh-lark-channel (profile ${spec.profile})`, 'description')}
 After=network-online.target
 
 [Service]
 ExecStart=${systemdQuote(spec.dsh)} --profile ${systemdQuote(spec.profile)}
-WorkingDirectory=${spec.workspace}
-${environment}StandardOutput=append:${logPath()}
-StandardError=append:${logPath()}
+WorkingDirectory=${systemdQuote(spec.workspace)}
+${environment}StandardOutput=append:${systemdQuote(logPath())}
+StandardError=append:${systemdQuote(logPath())}
 Restart=always
 RestartSec=5
 
@@ -460,28 +507,87 @@ WantedBy=default.target
 `
 }
 
-/** Run one command with the operator watching, and fail the CLI when it fails. */
-function must(argv: readonly string[], cwd?: string): void {
+/**
+ * The Windows extensions that are a shell script rather than an executable.
+ *
+ * Node refuses to spawn these without a shell (they need an interpreter named on
+ * a command line), which is the one case that still needs `cmd.exe`.
+ */
+const WINDOWS_SHIM = /\.(?:cmd|bat)$/i
+
+/** What one argument may never carry, because `cmd.exe` reads it as syntax. */
+const CMD_UNSAFE = /[\r\n"%!^&|<>]/
+
+/**
+ * Quote one token for a `cmd.exe` command line, refusing what quoting cannot make safe.
+ *
+ * `%` expands an environment variable and `!` does so under delayed expansion,
+ * `"` ends the quoting, and the rest are separators or redirections: a value
+ * carrying one cannot be handed to a command line at all, so it is refused
+ * loudly rather than escaped into something that means a different path.
+ * @param value - one argument.
+ * @returns the token, quoted when it carries whitespace.
+ * @throws when the token carries a character `cmd.exe` would read as syntax.
+ */
+function quoteWindowsArgument(value: string): string {
+  if (CMD_UNSAFE.test(value)) {
+    throw new Error(`refusing to pass ${JSON.stringify(value)} to cmd.exe: it carries a character a command line cannot quote`)
+  }
+  return /\s/.test(value) ? `"${value}"` : value
+}
+
+/**
+ * One `cmd.exe` command line from an argv array.
+ * @param command - the executable.
+ * @param args - its arguments.
+ * @returns the line to hand `/d /s /c`.
+ */
+export function windowsCommandLine(command: string, args: readonly string[]): string {
+  return [command, ...args].map(quoteWindowsArgument).join(' ')
+}
+
+/**
+ * Spawn one command without a shell, naming the platform's own interpreter.
+ *
+ * `shell: true` would hand `command + ' ' + args.join(' ')` to a shell, which
+ * re-reads every argument as syntax: a workspace path with a space splits in
+ * two, and a `&` in a name starts a second command. The argv array is therefore
+ * kept intact, and only the Windows shim — a `.cmd` the platform will not
+ * execute on its own — goes through `cmd.exe`, quoted by
+ * {@link windowsCommandLine} so the same rules apply to it.
+ * @param argv - the command and its arguments.
+ * @param options - spawn options, without `shell`.
+ * @returns the spawn result.
+ */
+function spawnOperator(
+  argv: readonly string[],
+  options: { cwd?: string | undefined; stdio: 'inherit' | 'ignore' },
+): ReturnType<typeof spawnSync> {
   const [command, ...args] = argv
   if (command === undefined) throw new Error('empty command')
-  const result = spawnSync(command, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
+  if (process.platform !== 'win32' || !WINDOWS_SHIM.test(command)) {
+    return spawnSync(command, args, options)
+  }
+  return spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', windowsCommandLine(command, args)], options)
+}
+
+/** Run one command with the operator watching, and fail the CLI when it fails. */
+function must(argv: readonly string[], cwd?: string): void {
+  const result = spawnOperator(argv, { cwd, stdio: 'inherit' })
   if (result.error !== undefined) throw result.error
-  if (result.status !== 0) throw new Error(`${command} exited ${result.status ?? 'by signal'}`)
+  if (result.status !== 0) throw new Error(`${argv[0] ?? 'command'} exited ${result.status ?? 'by signal'}`)
 }
 
 /** Run one command with the operator watching and report its exit code instead of throwing. */
 function passthrough(argv: readonly string[], cwd?: string): number {
-  const [command, ...args] = argv
-  if (command === undefined) throw new Error('empty command')
-  const result = spawnSync(command, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
+  const result = spawnOperator(argv, { cwd, stdio: 'inherit' })
   if (result.error !== undefined) throw result.error
   return result.status ?? 1
 }
 
 /** Run one command and swallow both its output and its failure. */
 function quiet(argv: readonly string[]): void {
-  const [command, ...args] = argv
-  if (command !== undefined) spawnSync(command, args, { stdio: 'ignore' })
+  if (argv[0] !== undefined) spawnOperator(argv, { stdio: 'ignore' })
 }
 
 /** The launchd domain target for the invoking user. */
@@ -514,20 +620,21 @@ function requireDsh(): string {
 }
 
 /**
- * Refuse a profile name that would place the workspace file outside the home.
+ * Refuse a profile name this CLI cannot spell into everything it writes.
  *
- * This function writes before any `dsh` process runs, so it is the first thing
- * to touch disk for a named profile — ahead of the host's own check. The rule
- * is the host's rule (`resolveProfileDir`), not a stricter one, so a name DSH
- * accepts is never rejected here.
+ * A profile name becomes a path component, a `WorkingDirectory` line, an
+ * `ExecStart` argument and a `cmd.exe` token, so the character set is stricter
+ * than the host's own rule on purpose: a space shears a unit line in two, a
+ * quote or a `%` cannot be expressed in one, and `&`/`|` are command syntax on
+ * the one platform that still needs a command line. Refusing here is the only
+ * place that can refuse before anything is written.
  * @param name - the requested profile name.
  * @returns the refusal to report, or undefined when the name is usable.
  */
 function refuseProfileName(name: string): string | undefined {
-  const reserved = name === '' || name === '.' || name === '..' || name === 'node_modules'
-  return reserved || name.includes('/') || name.includes('\\')
-    ? `invalid profile name ${JSON.stringify(name)}`
-    : undefined
+  return PROFILE_NAME.test(name) && name !== 'node_modules'
+    ? undefined
+    : `invalid profile name ${JSON.stringify(name)}: use letters, digits, dot, dash or underscore, starting with a letter or digit`
 }
 
 /** The key a top-level line declares, or undefined when the line declares none. */
@@ -701,7 +808,13 @@ async function bootoutAndWait(): Promise<void> {
 /** Write a unit readable by its owner alone, since it may carry forwarded credentials. */
 function writeUnit(path: string, contents: string): void {
   mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, contents)
+  // Created with the mode, not narrowed afterwards: the file may carry the app
+  // secret, and `writeFileSync`'s default leaves it world-readable until the
+  // `chmod` below — a window every local user can read, and a permanent one if
+  // this process dies in between.
+  writeFileSync(path, contents, { mode: 0o600 })
+  // Kept for a file that already existed with wider permissions: `mode` applies
+  // only when the file is created.
   chmodSync(path, 0o600)
 }
 
@@ -848,6 +961,11 @@ async function relayUntilOnboarded(from: number, deadline: number, instance?: st
 
 /** The profile's own patch layer, where a deployment's extra rows live. */
 export function patchPath(profile: string): string {
+  // Checked here rather than at each caller: this is the one function that turns
+  // a profile name into a path, and `remove` reaches it without passing the
+  // provisioning check that guards `start`.
+  const refusal = refuseProfileName(profile)
+  if (refusal !== undefined) throw new Error(refusal)
   return join(dshHome(), 'profiles', profile, 'cordis.patch.yml')
 }
 
@@ -1039,13 +1157,26 @@ export function readInstalledService(
       ...workspace === undefined ? {} : { workspace: xmlUnescape(workspace) },
     }
   }
-  // The writer quotes each argument, so the quotes come back off here.
-  const profile = /^ExecStart=.*?--profile\s+["']?([^"'\s]+)["']?/m.exec(document)?.[1]
+  // The writer quotes each argument, so the quotes come back off here. The name
+  // is read by the same character set the writer refused names outside of, which
+  // is what makes this regex the inverse of that writer rather than a guess: a
+  // quoted name cannot contain a quote, and a `dsh` path holding the literal
+  // `--profile ` cannot be mistaken for one.
+  const profile = /^ExecStart=.*?--profile\s+"?([A-Za-z0-9][A-Za-z0-9._-]*)"?/m.exec(document)?.[1]
   const workspace = /^WorkingDirectory=(.*)$/m.exec(document)?.[1]
   return {
     ...profile === undefined ? {} : { profile },
-    ...workspace === undefined ? {} : { workspace: workspace.trim() },
+    ...workspace === undefined ? {} : { workspace: systemdUnquote(workspace) },
   }
+}
+
+/** Undo the quoting and specifier escaping {@link systemdQuote} applies. */
+function systemdUnquote(value: string): string {
+  const trimmed = value.trim()
+  const unquoted = trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2
+    ? trimmed.slice(1, -1).replaceAll('\\"', '"').replaceAll('\\\\', '\\')
+    : trimmed
+  return unquoted.replaceAll('%%', '%')
 }
 
 /** Undo the escaping {@link launchdPlist} applies to a value. */
@@ -1237,14 +1368,47 @@ async function restart(): Promise<void> {
  * bot's console at — optionally following new output until interrupted.
  * @param follow - keep relaying as the file grows.
  */
+/**
+ * How far back `logs` looks without following.
+ *
+ * The log is truncated when `start` runs, but a bot left up for months outgrows
+ * that, and reading a multi-gigabyte file to print two hundred lines is how a
+ * diagnostics command turns into an out-of-memory event.
+ */
+const LOG_TAIL_BYTES = 256 * 1024
+
+/**
+ * The last bytes of a file, and whether the window cut a line in half.
+ * @param path - the file to read.
+ * @param maxBytes - how far back to look.
+ * @returns the tail as text, and whether anything before it was left out.
+ */
+function readTail(path: string, maxBytes: number): { text: string; truncated: boolean } {
+  const size = statSync(path).size
+  const from = Math.max(0, size - maxBytes)
+  const handle = openSync(path, 'r')
+  try {
+    const buffer = Buffer.alloc(size - from)
+    const bytesRead = readSync(handle, buffer, 0, buffer.length, from)
+    return { text: buffer.subarray(0, bytesRead).toString('utf8'), truncated: from > 0 }
+  } finally {
+    closeSync(handle)
+  }
+}
+
 async function logs(follow: boolean): Promise<void> {
   if (!existsSync(logPath())) {
     process.stderr.write(`dsh-lark-channel: no log yet at ${logPath()} — has \`${invocation()} start\` run?\n`)
     process.exitCode = 1
     return
   }
-  const lines = readFileSync(logPath(), 'utf8').split('\n')
-  process.stdout.write(lines.slice(Math.max(0, lines.length - 201)).join('\n'))
+  // The tail, not the whole file: the last 201 lines are what a reader came for.
+  const { text, truncated } = readTail(logPath(), LOG_TAIL_BYTES)
+  const lines = text.split('\n')
+  // A window that starts mid-line drops that partial line: it is half a record
+  // whose beginning lies outside the window.
+  const complete = truncated ? lines.slice(1) : lines
+  process.stdout.write(complete.slice(Math.max(0, complete.length - 201)).join('\n'))
   if (!follow) return
   let offset = logSize()
   for (;;) {

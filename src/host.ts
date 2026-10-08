@@ -427,15 +427,12 @@ export interface HostWorkspaceRegistry {
   list?(): readonly HostWorkspace[]
   /**
    * Sessions the operator archived: the host's own "hide this from every
-   * grouping surface". Optional for the same reason as {@link list}.
+   * grouping surface". Optional for the same reason as {@link list}. A chat
+   * whose session is in this set is refused rather than restored: lifting an
+   * archive is the operator's decision, and the host's admission gate is what
+   * enforces it.
    */
   readonly archivedSessionIds?: readonly string[]
-  /**
-   * Drop one session from the archive set durably, which is what lifts the
-   * host's archived-session admission gate for it. Optional: a deployment
-   * composing a registry older than archival has nothing to lift.
-   */
-  unarchiveSession?(id: string): Promise<void>
 }
 
 /** One provider route, as the `llm` registry advertises it. */

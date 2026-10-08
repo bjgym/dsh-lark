@@ -320,3 +320,74 @@ export function asPendingQuestion(
   if (typeof face.answer !== 'function') return undefined
   return pending as unknown as AnswerableQuestion
 }
+
+/**
+ * The one submission a question panel admits at a time.
+ *
+ * Two activations can land in one batch — an option row's Enter plus the submit
+ * button, or a key repeat — before a re-render disables either control, and the
+ * second would send the same batch again. The shipped class rejects that
+ * duplicate, and the rejection would surface to the user as a raw failure on an
+ * answer that did land, so a mount admits one submission at a time.
+ *
+ * The guard also carries the one reason a submission is re-opened. A waterfall
+ * answer the gateway dropped leaves the card open with its draft intact, and the
+ * panel re-arms its controls so the same draft can go through again; re-arming
+ * therefore RELEASES the guard and retires the token of whatever was in flight.
+ * That retirement is what keeps the two apart: the superseded submission's
+ * completion can neither clear the state of the submission that replaced it nor
+ * block it, and a dropped answer that later rejects is not reported as the
+ * failure of the retry.
+ */
+export interface SubmissionGuard {
+  /**
+   * Begin one submission.
+   * @returns the token identifying it, or undefined when one is already in flight.
+   */
+  begin(): number | undefined
+  /**
+   * Release the guard for a re-armed panel, retiring whatever was in flight.
+   */
+  rearm(): void
+  /**
+   * Whether one submission still owns the guard.
+   * @param token - the token {@link SubmissionGuard.begin} returned.
+   * @returns true when no re-arm retired it.
+   */
+  owns(token: number): boolean
+  /**
+   * Release the guard for a submission that finished.
+   * @param token - the token {@link SubmissionGuard.begin} returned.
+   * @returns true when it still owned the guard, so its outcome is the one the
+   * panel must report.
+   */
+  finish(token: number): boolean
+}
+
+/**
+ * Create one panel mount's submission guard.
+ * @returns the guard.
+ */
+export function createSubmissionGuard(): SubmissionGuard {
+  let issued = 0
+  let current: number | undefined
+  return {
+    begin() {
+      if (current !== undefined) return undefined
+      issued += 1
+      current = issued
+      return current
+    },
+    rearm() {
+      current = undefined
+    },
+    owns(token) {
+      return current === token
+    },
+    finish(token) {
+      if (current !== token) return false
+      current = undefined
+      return true
+    },
+  }
+}

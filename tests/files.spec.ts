@@ -92,8 +92,12 @@ describe('sanitizeFileName', () => {
   it('keeps only the last component of a path, however it escapes', () => {
     expect(sanitizeFileName('../../etc/passwd')).toBe('passwd')
     expect(sanitizeFileName('/etc/shadow')).toBe('shadow')
-    // POSIX `basename` does not split on a backslash, so the separator pass must.
-    expect(sanitizeFileName('C:\\Users\\me\\app.log')).toBe('C:_Users_me_app.log')
+    // `basename` follows the platform: on Windows a backslash IS a separator and
+    // the name is already the last component, while POSIX does not split on it —
+    // so the separator pass is what makes the result safe there. Both answers
+    // keep the file inside its landing directory, which is the point.
+    expect(sanitizeFileName('C:\\Users\\me\\app.log'))
+      .toBe(process.platform === 'win32' ? 'app.log' : 'C:_Users_me_app.log')
   })
 
   it('strips control characters out of the name', () => {

@@ -1,14 +1,14 @@
 /**
  * Continuing a session this conversation did not start.
  *
- * A conversation's session id is DERIVED — chat, workspace, epoch — and that is
- * what makes a restarted process find the same conversation again. The one
- * thing derivation cannot express is "carry on with that other session": the
- * one left behind by `/new`, or the one opened on a laptop in the web UI and
- * now wanted on a phone.
+ * A conversation's session id is DERIVED — chat, then the directory it is in —
+ * and that is what makes a restarted process find the same conversation again.
+ * The one thing derivation cannot express is "carry on with that other
+ * session": the one `/new` minted, or the one opened on a laptop in the web UI
+ * and now wanted on a phone.
  *
- * So a pick is an override on the derivation, and the whole design here follows
- * from what a chat can safely be shown and safely be given:
+ * So a pointer records which session the conversation is on, and the whole
+ * design here follows from what a chat can safely be shown and safely be given:
  *
  * - **Nothing is typed.** A session id is a machine identifier; asking someone
  *   to transcribe `lark-oc_…--e3` on a phone is not an interface. Every switch
@@ -416,9 +416,9 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
   }
 }
 
-/** Construction options for {@link ChatSessionPicks}. */
-export interface ChatSessionPicksOptions {
-  /** Persisted conversation-key → session id; an empty entry means derived. */
+/** Construction options for {@link ChatSessionPointers}. */
+export interface ChatSessionPointersOptions {
+  /** Persisted anchor-id → session id; an empty entry means the derived session. */
   readonly entries?: Record<string, string> | undefined
   /** Deep-merge one patch into the plugin's settings section; false = not composed. */
   readonly persist?: ((patch: { chatSessions: Record<string, string> }) => Promise<boolean>) | undefined
@@ -427,68 +427,85 @@ export interface ChatSessionPicksOptions {
 }
 
 /**
- * Which session each conversation was told to continue, against "the one it
- * derives" meaning no entry. Pure state plus injected persistence, mirroring
- * the workspace and model stores.
+ * Which session each conversation-and-directory currently runs, against "the
+ * one it derives" meaning no entry.
+ *
+ * One map for the two ways a conversation's session can be chosen: `/sessions`
+ * points it at a session that already exists, and `/new` points it at an id
+ * minted for the occasion. Keyed by the conversation's anchor id — the id it
+ * derives before any suffix — so each directory keeps its own thread: a `/cd`
+ * away and back returns to the session that directory was left on, which is
+ * what folding an epoch into the id used to buy, without a counter to lose.
+ *
+ * Pure state plus injected persistence, mirroring the workspace and model
+ * stores.
  */
-export class ChatSessionPicks {
+export class ChatSessionPointers {
   private readonly entries: Map<string, string>
   private readonly persist: (patch: { chatSessions: Record<string, string> }) => Promise<boolean>
   private readonly report: (line: string) => void
   private warnedNotDurable = false
 
-  constructor(options: ChatSessionPicksOptions = {}) {
+  constructor(options: ChatSessionPointersOptions = {}) {
     this.entries = new Map(Object.entries(options.entries ?? {}))
     this.persist = options.persist ?? (async () => false)
     this.report = options.report ?? (() => {})
   }
 
   /**
-   * The session one conversation was told to continue.
-   * @param key - the conversation key.
-   * @returns the picked id, or undefined when it runs on its derived one.
+   * The session one conversation-and-directory currently runs.
+   * @param anchorId - the id that conversation derives at this directory.
+   * @returns the pointed-at id, or undefined when it runs on its derived one.
    */
-  pickFor(key: string): string | undefined {
-    const entry = this.entries.get(key)
+  pointerFor(anchorId: string): string | undefined {
+    const entry = this.entries.get(anchorId)
     return entry === undefined || entry === NO_PICK ? undefined : entry
   }
 
   /**
-   * The conversations that were told to continue one session.
+   * The anchors whose pointer names one session.
    *
-   * Asked before anything would CREATE that id: a pick names a session that
-   * already exists, so reaching the create rung under a picked id means the
+   * Asked before anything would CREATE that id: a pointer names a session that
+   * already exists, so reaching the create rung under a pointed id means the
    * resume failed — and starting an empty session in its place would answer
    * "continue that conversation" by writing over the one that was asked for.
    * @param sessionId - the session id about to be created.
-   * @returns the conversation keys picking it, empty when none.
+   * @returns the anchor ids pointing at it, empty when none.
    */
-  keysPicking(sessionId: string): string[] {
+  anchorsPointingAt(sessionId: string): string[] {
     return [...this.entries].filter(([, value]) => value === sessionId).map(([key]) => key)
   }
 
   /**
-   * Record a pick, or clear it.
+   * Every recorded entry, for migrating the keys of an older format.
+   * @returns a detached view of the stored anchor-id → session-id pairs.
+   */
+  snapshot(): ReadonlyMap<string, string> {
+    return new Map(this.entries)
+  }
+
+  /**
+   * Record a pointer, or clear it.
    *
-   * Clearing is what `/cd` and `/new` do: both change which session this
-   * conversation derives, and a pick that survived them would quietly win over
-   * the very thing the person just asked for.
-   * @param key - the conversation key.
-   * @param sessionId - the session to continue; undefined returns to derivation.
+   * Clearing is what `/cd` used to do and what picking a conversation's own
+   * session does: a pointer that survived either would quietly win over the
+   * very thing the person just asked for.
+   * @param anchorId - the conversation-and-directory id.
+   * @param sessionId - the session to run; undefined returns to derivation.
    * @returns whether it changed, and whether it survives a restart.
    */
-  async set(key: string, sessionId: string | undefined): Promise<{ changed: boolean; durable: boolean }> {
+  async set(anchorId: string, sessionId: string | undefined): Promise<{ changed: boolean; durable: boolean }> {
     const value = sessionId ?? NO_PICK
-    const changed = (this.entries.get(key) ?? NO_PICK) !== value
-    this.entries.set(key, value)
+    const changed = (this.entries.get(anchorId) ?? NO_PICK) !== value
+    this.entries.set(anchorId, value)
     if (!changed) return { changed: false, durable: true }
-    const durable = await this.persist({ chatSessions: { [key]: value } }).catch((error: unknown) => {
-      this.report(`lark-channel: persisting the session pick failed: ${String(error)}`)
+    const durable = await this.persist({ chatSessions: { [anchorId]: value } }).catch((error: unknown) => {
+      this.report(`lark-channel: persisting the session pointer failed: ${String(error)}`)
       return false
     })
     if (!durable && !this.warnedNotDurable) {
       this.warnedNotDurable = true
-      this.report('lark-channel: session picks are in-memory only (no settings service); they reset on restart')
+      this.report('lark-channel: session pointers are in-memory only (no settings service); they reset on restart')
     }
     return { changed, durable }
   }
@@ -532,10 +549,11 @@ export function isDelegated(record: HostSessionRecord): boolean {
  * `base` belongs to.
  *
  * Session ids are built by concatenation — `<prefix><key>`, then `--<digest>`
- * for a workspace and `--e<n>` for an epoch — so a conversation's own family is
+ * for a workspace, and either `--s<random>` for a session `/new` minted or
+ * `--e<n>` for one an older release counted — so a conversation's own family is
  * exactly the ids that start with its base.
  * @param id - the session id to test.
- * @param base - this conversation's own id before workspace and epoch suffixes.
+ * @param base - this conversation's own id before any suffix.
  * @returns true when the id belongs to this conversation.
  */
 function isOwnSession(id: string, base: string): boolean {
@@ -558,7 +576,7 @@ function isChatSession(id: string, marker: string): boolean {
 
 /** What the picker needs to know about the conversation it is built for. */
 export interface SessionPickerInput {
-  /** This conversation's own base session id, before workspace and epoch suffixes. */
+  /** This conversation's own base session id, before any suffix. */
   readonly base: string
   /** The session this conversation resolves to right now. */
   readonly current: string

@@ -17,6 +17,7 @@
  * @module dsh-lark-channel/questions
  */
 
+import { randomUUID } from 'node:crypto'
 import {
   questionCard as buildQuestionCard,
   settledQuestionCard as buildSettledQuestionCard,
@@ -27,6 +28,20 @@ export const QUESTION_ACTION = 'dsh-lark-channel/question'
 
 /** How long a question waits for its human before the tool gives up. */
 export const QUESTION_TIMEOUT_MS = 30 * 60 * 1000
+
+/**
+ * One press of a question button, as the authorization check needs it.
+ *
+ * The chat is what makes a press this question's own: a card can be forwarded
+ * and its payload travels with it, so nothing inside the payload can say where
+ * the press happened.
+ */
+export interface QuestionClick {
+  /** The chat the press arrived in. */
+  readonly chatId: string
+  /** Who pressed, when the callback named them. */
+  readonly operatorId?: string | undefined
+}
 
 /** One choice the model offered. */
 export interface QuestionOption {
@@ -179,7 +194,6 @@ interface Pending {
  */
 export class ChatQuestions {
   private readonly pending = new Map<string, Pending>()
-  private counter = 0
 
   constructor(private readonly ports: QuestionPorts) {}
 
@@ -203,8 +217,13 @@ export class ChatQuestions {
     readonly signal?: AbortSignal | undefined
     readonly timeoutMs?: number | undefined
   }): Promise<QuestionAnswer> {
-    this.counter += 1
-    const id = `q${this.counter}`
+    // A turn that was already cancelled must not be asked: `AbortSignal` does
+    // not replay for a listener added late, so without this the card would go
+    // out, the tool would park for its whole timeout, and a press in that
+    // window would decide a turn nobody is running. The sibling askers in
+    // `bridge.ts` guard the same way, for the same reason.
+    if (input.signal?.aborted === true) return { id: input.question.id, selected: [] }
+    const id = `q-${randomUUID()}`
     let settle!: (answer: QuestionAnswer) => void
     const answered = new Promise<QuestionAnswer>((resolve) => { settle = resolve })
     const entry: Pending = {
@@ -233,12 +252,28 @@ export class ChatQuestions {
       entry.messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
       if (entry.settled) {
         // Settled while the card was in flight; paint what the platform just
-        // rendered so no live buttons are left behind.
+        // rendered so no live buttons are left behind. Caught like the sibling
+        // repaint below: this runs off no caller's await, and an unhandled
+        // rejection here is a process-level fault for one failed card.
         void this.ports.update(entry.messageId, settledQuestionCard(input.question, { cancelled: true }))
+          .catch((error: unknown) => {
+            this.ports.report(`lark-channel: repainting a settled question failed: ${String(error)}`)
+          })
       }
     } catch (error) {
-      this.ports.report(`lark-channel: sending a question card failed: ${String(error)}`)
-      this.finish(id, { id: input.question.id, selected: [] }, false)
+      // One retry, because a card send fails transiently far more often than it
+      // fails permanently. A question that still cannot be delivered answers
+      // empty — the host's answer shape carries no error channel, and putting
+      // this channel's words into the human's answer would be worse than the
+      // silence — so the operator gets the reason here, which is the only place
+      // that can hold it.
+      this.ports.report(`lark-channel: sending a question card failed, retrying once: ${String(error)}`)
+      try {
+        entry.messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
+      } catch (retry: unknown) {
+        this.ports.report(`lark-channel: sending a question card failed again, so no answer was asked for: ${String(retry)}`)
+        this.finish(id, { id: input.question.id, selected: [] }, false)
+      }
     }
 
     try {
@@ -253,11 +288,23 @@ export class ChatQuestions {
   /**
    * Answer by clicking an option.
    * @param value - the parsed card action.
+   * @param click - who pressed, and the chat the press arrived in.
+   * @param chosen - option positions a form submission carried, when it did.
    * @returns whether it settled a live question.
    */
-  answerByClick(value: QuestionActionValue, chosen?: readonly string[]): object | undefined {
+  answerByClick(value: QuestionActionValue, click: QuestionClick, chosen?: readonly string[]): object | undefined {
     const entry = this.pending.get(value.id)
     if (entry === undefined || entry.settled) return undefined
+    // The press has to arrive in the chat the card was published to. A card can
+    // be forwarded and its payload travels with it, so the chat is the one
+    // check a forwarded press cannot satisfy — and without it a press in another
+    // room would answer a question this room was asked.
+    if (click.chatId !== entry.chatId) {
+      this.ports.report(
+        `lark-channel: ignored a question click from chat ${click.chatId}; the card was published to ${entry.chatId}`,
+      )
+      return undefined
+    }
     if (value.option === SUBMIT_OPTION) return this.answerBySubmission(value.id, entry, chosen ?? [])
     const option = (entry.question.options ?? [])[value.option]
     if (option === undefined) return undefined
@@ -283,8 +330,15 @@ export class ChatQuestions {
    */
   private answerBySubmission(id: string, entry: Pending, chosen: readonly string[]): object | undefined {
     const options = entry.question.options ?? []
-    const picked = [...new Set(chosen)]
-      .map(index => options[Number(index)])
+    // Read as positions and only as positions: `Number('')` is 0 and
+    // `Number('0x1')` is 1, so a non-canonical entry would otherwise select the
+    // FIRST option — the approve label, on a plan card — while this method's
+    // contract says an unreadable submission is refused rather than answered.
+    const positions = chosen
+      .map(position => (/^(?:0|[1-9][0-9]*)$/.test(position) ? Number(position) : Number.NaN))
+      .filter(position => Number.isSafeInteger(position))
+    const picked = [...new Set(positions)]
+      .map(position => options[position])
       .filter((option): option is QuestionOption => option !== undefined)
       .map(option => option.label)
     if (picked.length === 0) return undefined

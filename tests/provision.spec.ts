@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   DEFAULT_PROFILE,
@@ -61,8 +61,10 @@ describe('parseArguments', () => {
   })
 
   it('reads the profile and workspace of an explicit start', () => {
+    // `resolve`, because a workspace is made absolute as it is parsed: the
+    // assertion is about what was read, not about this machine's drive layout.
     expect(parseArguments(['start', '--profile', 'bot', '--workspace', '/srv/work']))
-      .toMatchObject({ kind: 'start', profile: 'bot', workspace: '/srv/work' })
+      .toMatchObject({ kind: 'start', profile: 'bot', workspace: resolve('/srv/work') })
   })
 
   it('resolves a relative workspace against the invoking directory', () => {
@@ -352,12 +354,14 @@ describe('servicePath', () => {
   })
 
   it('carries the operator\'s PATH through, so the agent still finds its tools', () => {
-    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', '/opt/homebrew/bin:/usr/bin').split(delimiter)
+    // Joined with this platform's own delimiter, because that is what the
+    // function is handed on the machine it runs on.
+    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', ['/opt/homebrew/bin', '/usr/bin'].join(delimiter)).split(delimiter)
     expect(entries).toContain('/opt/homebrew/bin')
   })
 
   it('dedupes and drops empty entries, and always ends up with the system ones', () => {
-    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', '/opt/bin::/usr/bin').split(delimiter)
+    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', ['/opt/bin', '', '/usr/bin'].join(delimiter)).split(delimiter)
     expect(entries.filter((entry) => entry === '/opt/bin')).toHaveLength(1)
     expect(entries).not.toContain('')
     expect(entries).toContain('/usr/bin')
@@ -375,7 +379,23 @@ describe('unit files', () => {
 
     const unit = systemdUnit(spec)
     expect(unit).toContain(`ExecStart="${spec.dsh}" --profile "${spec.profile}"`)
-    expect(unit).toContain(`WorkingDirectory=${spec.workspace}`)
+    // Quoted like every other value in the file: a workspace path with a space
+    // in it shears apart at the first whitespace otherwise, and the service then
+    // starts in a directory that does not exist.
+    expect(unit).toContain(`WorkingDirectory="${spec.workspace}"`)
+  })
+
+  it('escapes what a unit file reads as syntax, and refuses what it cannot carry', () => {
+    // `%` is systemd's specifier sigil, so a path or a secret carrying one has
+    // to be doubled or systemd substitutes something else for it.
+    const percent = systemdUnit({ ...spec, workspace: '/srv/100%work' })
+    expect(percent).toContain('WorkingDirectory="/srv/100%%work"')
+
+    // A line break cannot be expressed in a line-oriented file at all: it would
+    // end its own line and start a directive, so it is refused rather than
+    // silently split into two.
+    expect(() => systemdUnit({ ...spec, workspace: '/srv/work\nUser=root' })).toThrow(/line break/)
+    expect(() => systemdUnit({ ...spec, profile: 'lark\nUser=root' })).toThrow(/line break/)
   })
 
   it('asks the supervisor to keep the bot up', () => {

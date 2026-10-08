@@ -127,7 +127,7 @@ describe('multiple choice', () => {
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
     const submit = questionActionValue(cardControls(sent[0]!.card)[0]!.value)!
 
-    const settled = store.answerByClick(submit, ['0', '2'])
+    const settled = store.answerByClick(submit, { chatId: 'oc_1' }, ['0', '2'])
     expect(await answer).toEqual({ id: 'q-scope', selected: ['bridge', 'session'] })
     expect(settled).toBeDefined()
     expect(textOf(settled!)).toContain('bridge、session')
@@ -140,8 +140,12 @@ describe('multiple choice', () => {
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
     const submit = questionActionValue(cardControls(sent[0]!.card)[0]!.value)!
 
-    expect(store.answerByClick(submit, [])).toBeUndefined()
-    expect(store.answerByClick(submit, ['9'])).toBeUndefined()
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, [])).toBeUndefined()
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, ['9'])).toBeUndefined()
+    // A position that is not a position names nothing: `Number('')` is 0 and
+    // `Number('0x1')` is 1, so a non-canonical entry must not select an option.
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, [''])).toBeUndefined()
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, ['0x1'])).toBeUndefined()
     expect(store.awaiting('s1')).toBe(true)
     // Still answerable, by the same means as any other question.
     store.answerByText('s1', '全都要')
@@ -162,7 +166,7 @@ describe('ChatQuestions', () => {
     expect(store.awaiting('s1')).toBe(true)
 
     const [, second] = buttonsOf(sent[0]!.card)
-    const settled = store.answerByClick({ kind: QUESTION_ACTION, id: second!.id, option: second!.option })
+    const settled = store.answerByClick({ kind: QUESTION_ACTION, id: second!.id, option: second!.option }, { chatId: 'oc_1' })
     expect(await answer).toEqual({ id: 'q-deploy', selected: ['先跑测试'] })
     // The decided card comes BACK from the click, for the caller to return in
     // the callback response — the patch API's refusals are invisible, so a
@@ -194,13 +198,51 @@ describe('ChatQuestions', () => {
     await answer
   })
 
+  it('ignores a click that arrives from another chat, and says so on the console', async () => {
+    const { store, sent, reports } = createStore()
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const [first] = buttonsOf(sent[0]!.card)
+
+    // A card can be forwarded and its payload travels with it, so the chat is
+    // the one fact a forwarded press cannot fake: the question stays open.
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_elsewhere' }))
+      .toBeUndefined()
+    expect(store.awaiting('s1')).toBe(true)
+    expect(reports.some(line => line.includes('oc_elsewhere'))).toBe(true)
+
+    // The press from the chat the card belongs to still counts.
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_1' })).toBeDefined()
+    expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+  })
+
+  it('asks nothing at all when the turn was already cancelled', async () => {
+    const { store, sent, reports } = createStore()
+    const controller = new AbortController()
+    controller.abort()
+
+    const answer = await store.ask({
+      sessionId: 's1',
+      chatId: 'oc_1',
+      question: asked,
+      signal: controller.signal,
+    })
+
+    // The abort event does not replay for a listener added late, so the entry
+    // check is what keeps a cancelled turn from posting a card that would park
+    // the tool for its whole timeout.
+    expect(answer).toEqual({ id: 'q-deploy', selected: [] })
+    expect(sent).toHaveLength(0)
+    expect(reports).toHaveLength(0)
+  })
+
   it('settles exactly once: a second click or answer is refused', async () => {
     const { store, sent, updated } = createStore()
     const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
     const [first] = buttonsOf(sent[0]!.card)
-    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 })).toBeDefined()
-    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 1 })).toBeUndefined()
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_1' })).toBeDefined()
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 1 }, { chatId: 'oc_1' })).toBeUndefined()
     expect(store.answerByText('s1', 'too late')).toBe(false)
     expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
     // The click painted its own card, so no patch was attempted at all.

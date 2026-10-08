@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  ChatSessionPicks,
+  ChatSessionPointers,
   offerSessions,
   PICKER_ROWS,
   readTitles,
@@ -135,36 +135,53 @@ describe('reading titles', () => {
   })
 })
 
-describe('the pick a conversation carries', () => {
+describe('the pointer a conversation carries', () => {
   it('records, clears, and persists exactly the changes', async () => {
     const patches: object[] = []
-    const picks = new ChatSessionPicks({ persist: async (patch) => { patches.push(patch); return true } })
+    const pointers = new ChatSessionPointers({ persist: async (patch) => { patches.push(patch); return true } })
 
-    expect(picks.pickFor('chat')).toBeUndefined()
-    expect(await picks.set('chat', 'session-web-ui')).toMatchObject({ changed: true, durable: true })
-    expect(picks.pickFor('chat')).toBe('session-web-ui')
-    expect(await picks.set('chat', 'session-web-ui')).toMatchObject({ changed: false })
-    expect(await picks.set('chat', undefined)).toMatchObject({ changed: true })
-    expect(picks.pickFor('chat')).toBeUndefined()
+    expect(pointers.pointerFor('lark-oc_1--abc')).toBeUndefined()
+    expect(await pointers.set('lark-oc_1--abc', 'session-web-ui')).toMatchObject({ changed: true, durable: true })
+    expect(pointers.pointerFor('lark-oc_1--abc')).toBe('session-web-ui')
+    expect(await pointers.set('lark-oc_1--abc', 'session-web-ui')).toMatchObject({ changed: false })
+    expect(await pointers.set('lark-oc_1--abc', undefined)).toMatchObject({ changed: true })
+    expect(pointers.pointerFor('lark-oc_1--abc')).toBeUndefined()
     expect(patches).toEqual([
-      { chatSessions: { chat: 'session-web-ui' } },
-      { chatSessions: { chat: '' } },
+      { chatSessions: { 'lark-oc_1--abc': 'session-web-ui' } },
+      { chatSessions: { 'lark-oc_1--abc': '' } },
     ])
   })
 
-  it('reads a stored empty entry as no pick at all', () => {
-    // The stored marker for "no pick" and a missing key mean the same thing;
+  it('reads a stored empty entry as no pointer at all', () => {
+    // The stored marker for "no pointer" and a missing key mean the same thing;
     // an empty string reaching the derivation would name a session with no id.
-    const picks = new ChatSessionPicks({ entries: { chat: '', other: 'session-x' } })
-    expect(picks.pickFor('chat')).toBeUndefined()
-    expect(picks.pickFor('other')).toBe('session-x')
+    const pointers = new ChatSessionPointers({ entries: { 'lark-oc_1': '', 'lark-oc_2': 'session-x' } })
+    expect(pointers.pointerFor('lark-oc_1')).toBeUndefined()
+    expect(pointers.pointerFor('lark-oc_2')).toBe('session-x')
   })
 
-  it('says once when picks will not survive a restart', async () => {
+  it('names the anchors pointing at one session', () => {
+    const pointers = new ChatSessionPointers({
+      entries: { 'lark-oc_1--abc': 'session-x', 'lark-oc_1--def': 'session-x', 'lark-oc_2': 'session-y' },
+    })
+    expect(pointers.anchorsPointingAt('session-x')).toEqual(['lark-oc_1--abc', 'lark-oc_1--def'])
+    expect(pointers.anchorsPointingAt('session-z')).toEqual([])
+  })
+
+  it('hands out a detached snapshot, for migrating an older key format', async () => {
+    const pointers = new ChatSessionPointers({ entries: { chat: 'session-x' } })
+    const snapshot = pointers.snapshot()
+    expect([...snapshot]).toEqual([['chat', 'session-x']])
+    await pointers.set('chat', undefined)
+    // The snapshot is a copy: a migration cannot observe later writes through it.
+    expect([...snapshot]).toEqual([['chat', 'session-x']])
+  })
+
+  it('says once when pointers will not survive a restart', async () => {
     const reports: string[] = []
-    const picks = new ChatSessionPicks({ persist: async () => false, report: (line) => reports.push(line) })
-    await picks.set('chat', 'a')
-    await picks.set('chat', 'b')
+    const pointers = new ChatSessionPointers({ persist: async () => false, report: (line) => reports.push(line) })
+    await pointers.set('lark-oc_1', 'a')
+    await pointers.set('lark-oc_1', 'b')
     expect(reports.filter(line => line.includes('in-memory only'))).toHaveLength(1)
   })
 })

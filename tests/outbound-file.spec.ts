@@ -8,9 +8,9 @@ import {
   describeRefusalForChat,
   describeRefusalForModel,
   GET_COMMAND,
+  readGetTarget,
   readOutboundFile,
   resolveOutboundFile,
-  runGetCommand,
   SEND_FILE_TOOL,
   sendFileTool,
 } from '../src/outbound-file.ts'
@@ -509,65 +509,40 @@ describe('send_file tool', () => {
   })
 })
 
-describe('runGetCommand', () => {
+describe('readGetTarget', () => {
   it('explains itself when the line carries no path', async () => {
     const workspace = createWorkspace()
-    const sent: OutboundFile[] = []
-    const reply = await runGetCommand(`/${GET_COMMAND}`, workspace, 1024, async (file) => { sent.push(file) })
+    const target = await readGetTarget(`/${GET_COMMAND}`, workspace, 1024)
 
-    expect(reply).toContain(`/${GET_COMMAND} <路径>`)
-    expect(sent).toEqual([])
+    expect(target.ok).toBe(false)
+    expect(target.ok ? '' : target.reply).toContain(`/${GET_COMMAND} <路径>`)
   })
 
   it('refuses in 中文 what the tool refuses in English, through the same check', async () => {
     const workspace = createWorkspace()
     const outside = createWorkspace()
     await writeFile(join(outside, 'secret.md'), 'not yours')
-    const sent: OutboundFile[] = []
-    const reply = await runGetCommand(
-      `/${GET_COMMAND} ${join(outside, 'secret.md')}`,
-      workspace,
-      1024,
-      async (file) => { sent.push(file) },
-    )
+    const target = await readGetTarget(`/${GET_COMMAND} ${join(outside, 'secret.md')}`, workspace, 1024)
 
-    expect(reply).toBe(`⚠️ ${describeRefusalForChat({ code: 'outside_workspace' })}`)
-    expect(sent).toEqual([])
+    expect(target.ok).toBe(false)
+    expect(target.ok ? '' : target.reply).toBe(`⚠️ ${describeRefusalForChat({ code: 'outside_workspace' })}`)
   })
 
-  it('says nothing at all when the file itself is the reply', async () => {
+  it('hands back the cleared file and its bytes, saying nothing at all', async () => {
     const workspace = createWorkspace()
     await writeFile(join(workspace, 'report.md'), '# 报告')
-    const sent: { file: OutboundFile; bytes: Buffer }[] = []
-    const reply = await runGetCommand(
-      `/${GET_COMMAND}   ./report.md  `,
-      workspace,
-      1024,
-      async (file, bytes) => { sent.push({ file, bytes }) },
-    )
+    const target = await readGetTarget(`/${GET_COMMAND}   ./report.md  `, workspace, 1024)
 
-    expect(reply).toBeUndefined()
-    expect(sent).toHaveLength(1)
-    expect(sent[0]!.file).toEqual({
+    expect(target.ok).toBe(true)
+    if (!target.ok) return
+    expect(target.file).toEqual({
       path: join(workspace, 'report.md'),
       fileName: 'report.md',
       bytes: 8,
       pathInWorkspace: 'report.md',
       workspaceName: basename(workspace),
     })
-    expect(sent[0]!.bytes.toString('utf8')).toBe('# 报告')
-  })
-
-  it('tells the chat when the send failed instead of going quiet', async () => {
-    const workspace = createWorkspace()
-    await writeFile(join(workspace, 'report.md'), 'body')
-    const reply = await runGetCommand(`/${GET_COMMAND} report.md`, workspace, 1024, async () => {
-      throw new Error('upload rejected: 230013')
-    })
-
-    expect(reply).toContain('⚠️')
-    expect(reply).toContain('report.md')
-    expect(reply).toContain('230013')
+    expect(target.bytes.toString('utf8')).toBe('# 报告')
   })
 
   // Root reads a mode-000 file regardless, which would leave this passing for the
@@ -580,20 +555,15 @@ describe('runGetCommand', () => {
     // Stats as a regular file under the ceiling, so it clears the check and fails
     // in the read — where the message Node builds quotes the absolute path.
     denyRead(path)
-    const sent: OutboundFile[] = []
-    const reply = await runGetCommand(
-      `/${GET_COMMAND} out/report.md`,
-      workspace,
-      1024,
-      async (file) => { sent.push(file) },
-    )
+    const target = await readGetTarget(`/${GET_COMMAND} out/report.md`, workspace, 1024)
 
-    expect(sent).toEqual([])
-    expect(reply).toContain('⚠️')
+    expect(target.ok).toBe(false)
+    if (target.ok) return
+    expect(target.reply).toContain('⚠️')
     // Which file, and why, in the form the human typed it.
-    expect(reply).toContain(join('out', 'report.md'))
-    expect(reply).toContain(READ_DENIED_CODE)
+    expect(target.reply).toContain(join('out', 'report.md'))
+    expect(target.reply).toContain(READ_DENIED_CODE)
     // `/get` answers in the chat, and in a group that is a whole room.
-    expect(reply).not.toContain(workspace)
+    expect(target.reply).not.toContain(workspace)
   })
 })

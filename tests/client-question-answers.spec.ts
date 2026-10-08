@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  answerBatchOf, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion,
+  answerBatchOf, createSubmissionGuard, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion,
 } from '../src/client/question-store.ts'
 import type { AnswerableQuestion, QuestionSpec } from '../src/client/question-store.ts'
 import { createQuestionDrafts } from '../src/client/question-drafts.ts'
@@ -321,5 +321,50 @@ describe('folding the question the log shows was answered', () => {
     }
 
     expect(foldSettledQuestions(windowOf([call('call-1'), noise]), new Set())).toEqual([])
+  })
+})
+
+describe('the guard one panel mount submits through', () => {
+  it('admits one submission at a time', () => {
+    const guard = createSubmissionGuard()
+    const first = guard.begin()
+
+    expect(first).toBeDefined()
+    expect(guard.begin()).toBeUndefined()
+  })
+
+  it('admits the retry a re-armed panel asks for', () => {
+    // A waterfall answer the gateway dropped leaves the card open with its draft
+    // intact, and the panel re-arms its controls so the same draft can go again.
+    const guard = createSubmissionGuard()
+    const dropped = guard.begin()
+    guard.rearm()
+
+    const retried = guard.begin()
+
+    expect(retried).toBeDefined()
+    expect(retried).not.toBe(dropped)
+  })
+
+  it('retires the dropped submission, so its outcome cannot touch the retry', () => {
+    const guard = createSubmissionGuard()
+    const dropped = guard.begin()!
+    guard.rearm()
+    const retried = guard.begin()!
+
+    expect(guard.owns(dropped)).toBe(false)
+    // The dropped answer rejecting later must not be reported as the retry's
+    // failure, and must not release the retry's guard either.
+    expect(guard.finish(dropped)).toBe(false)
+    expect(guard.owns(retried)).toBe(true)
+  })
+
+  it('releases the guard for the submission that finished', () => {
+    const guard = createSubmissionGuard()
+    const token = guard.begin()!
+
+    expect(guard.finish(token)).toBe(true)
+    expect(guard.finish(token)).toBe(false)
+    expect(guard.begin()).toBeDefined()
   })
 })

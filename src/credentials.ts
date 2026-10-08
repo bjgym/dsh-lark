@@ -8,6 +8,12 @@
  * operation picks them up. Configuration surfaces then describe a secret
  * without ever holding one.
  *
+ * "The next operation" is the limit worth stating: this channel resolves the
+ * secret at boot and hands it to a transport that keeps it as a constructor
+ * option, so a rotation the seam reports after that is re-read and said out
+ * loud (`runtime.ts`), while only a restart connects with it. Subscribing to
+ * the seam's notification is what makes that visible rather than silent.
+ *
  * This plugin used to persist the scanned secret straight into the user
  * settings document, which is the wrong home for it twice over: that document
  * is meant to be read and hand-edited, and it is the same file a deployment
@@ -82,7 +88,12 @@ export async function resolveAppSecret(
   config: { readonly appSecret?: string | undefined; readonly appSecretRef?: string | undefined },
   report: (line: string) => void,
 ): Promise<string | undefined> {
-  if (config.appSecret !== undefined && config.appSecret !== '') return config.appSecret
+  // Only a non-empty string is a secret the deployment injected. A value that
+  // arrived from configuration may be neither: an inline `!!js` expression whose
+  // environment variable is unset resolves to a non-string, and returning that
+  // would hand the transport a value that is not a secret while hiding the
+  // reference that does hold one.
+  if (typeof config.appSecret === 'string' && config.appSecret !== '') return config.appSecret
   const ref = config.appSecretRef
   if (ref === undefined || ref === '') return undefined
   if (!isCredentialRef(ref)) {
@@ -158,7 +169,11 @@ export async function migrateAppSecret(
   ref: string = APP_SECRET_REF,
 ): Promise<string | undefined> {
   const secret = config.appSecret
-  if (secret === undefined || secret === '') return undefined
+  // Only a non-empty string is a secret to move. A value that arrived from
+  // configuration may be neither — an inline `!!js` expression whose variable is
+  // unset resolves to a non-string — and storing that would overwrite the very
+  // credential this migration exists to repair.
+  if (typeof secret !== 'string' || secret === '') return undefined
   if (credentials === undefined) return undefined
   const stored = await storeAppSecret(credentials, secret, report, ref)
   if (stored.ref === undefined) return undefined

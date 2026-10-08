@@ -1,6 +1,6 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { sessionIdFor } from '../src/session.ts'
 import {
@@ -11,6 +11,7 @@ import {
   runWorkspaceCommand,
   withinRoots,
   workspaceChoices,
+  workspaceOverride,
   workspaceSessionId,
 } from '../src/workspace.ts'
 import type { WorkspaceProbe } from '../src/workspace.ts'
@@ -65,12 +66,30 @@ describe('workspaceSessionId', () => {
     expect(alpha).not.toBe(workspaceSessionId('oc_2', '/srv/alpha'))
     expect(alpha.startsWith(`${sessionIdFor('oc_1')}--`)).toBe(true)
   })
+
+  it('ignores an override that names no directory, instead of hashing it', () => {
+    // The value comes from a hand-editable document. A non-string one used to
+    // reach this hash and throw out of the bridge's installation, which muted a
+    // whole deployment: the chat stayed connected with nothing reading it.
+    expect(workspaceOverride(undefined)).toBeUndefined()
+    expect(workspaceOverride('')).toBeUndefined()
+    expect(workspaceOverride(() => {})).toBeUndefined()
+    expect(workspaceOverride(42)).toBeUndefined()
+    expect(workspaceOverride('/srv/alpha')).toBe('/srv/alpha')
+
+    // A conversation whose stored entry is junk stays on its derived session.
+    expect(workspaceSessionId('oc_1', () => {})).toBe(sessionIdFor('oc_1'))
+    expect(workspaceSessionId('oc_1', 42)).toBe(sessionIdFor('oc_1'))
+  })
 })
 
 describe('expandHome', () => {
   it('expands ~ and ~/ against the home, and leaves everything else alone', () => {
     expect(expandHome('~', '/home/me')).toBe('/home/me')
-    expect(expandHome('~/work', '/home/me')).toBe('/home/me/work')
+    // `resolve`, not string concatenation: on Windows the home's own spelling
+    // gains a drive letter when a path is made absolute, and the assertion is
+    // about the expansion rather than about this machine's layout.
+    expect(expandHome('~/work', '/home/me')).toBe(resolve('/home/me', 'work'))
     expect(expandHome('/abs/path', '/home/me')).toBe('/abs/path')
     expect(expandHome('relative', '/home/me')).toBe('relative')
   })

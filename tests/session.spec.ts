@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { HostAgentHandle } from '../src/host.ts'
-import { ConversationSessions, conversationKey, sessionIdFor } from '../src/session.ts'
+import { ConversationSessions, conversationKey, sessionIdFor, SessionRefusedError } from '../src/session.ts'
 import type { SessionLadder, SessionScope } from '../src/session.ts'
 import { fakeMessage } from './harness.ts'
 
@@ -16,6 +16,8 @@ interface LadderBehavior {
   live?: string[]
   /** Session ids `resume` loads; every other id rejects as unstored. */
   resumable?: string[]
+  /** Session ids `resume` refuses outright, as an archived session is refused. */
+  refuse?: string[]
   /** Reject `create` instead of producing an agent. */
   failCreate?: boolean
   /** Reject every produced agent's `dispose`. */
@@ -57,6 +59,9 @@ function createFakeLadder(behavior: LadderBehavior = {}) {
     },
     async resume(sessionId) {
       calls.push({ rung: 'resume', sessionId })
+      if (behavior.refuse?.includes(sessionId) === true) {
+        throw new SessionRefusedError(`这个会话已被归档（fake）：${sessionId}`)
+      }
       if (behavior.resumable?.includes(sessionId) !== true) throw new Error(`no stored session (fake): ${sessionId}`)
       return handleFor(sessionId)
     },
@@ -245,6 +250,20 @@ describe('conversation sessions', () => {
       expect(host.reports).toHaveLength(1)
       expect(host.reports[0]!).toContain('oc_chat_1:ou_sender_1')
       expect(host.reports[0]!).toContain('no stored session (fake)')
+      await sessions.close()
+    })
+
+    it('ends the walk on a refusal instead of creating the refused id', async () => {
+      const sessionId = sessionIdFor('oc_chat_1')
+      const host = createFakeLadder({ resumable: [sessionId], refuse: [sessionId] })
+      const sessions = new ConversationSessions('chat', host.ladder)
+
+      await expect(sessions.acquire(fakeMessage())).rejects.toThrow('已被归档')
+      expect(host.asked('resume')).toEqual([sessionId])
+      // A refusal is not "nothing is stored here": creating would write over the
+      // session this channel just declined to open, under the id it named.
+      expect(host.asked('create')).toEqual([])
+      expect(host.disposals).toEqual([])
       await sessions.close()
     })
 

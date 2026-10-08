@@ -36,7 +36,17 @@ export interface Config {
    * stored moves.
    */
   instance?: string
-  /** Lark/Feishu app id (`cli_…`); absent (with no stored credential) starts first-boot QR registration. */
+  /**
+   * Lark/Feishu app id (`cli_…`); absent (with no stored credential) starts
+   * first-boot QR registration.
+   *
+   * Only a non-empty string names an app. A deployment that derives this from an
+   * environment variable may supply neither: a `!!js` expression whose variable
+   * is unset reaches the plugin as a non-string, and that is treated exactly as
+   * "no app configured" — the registration flow refuses any other value, so
+   * passing one through would answer a missing credential with a failed
+   * registration instead of the code that creates one.
+   */
   appId?: string
   /**
    * Lark/Feishu app secret paired with {@link appId}. A deployment that
@@ -77,15 +87,18 @@ export interface Config {
    */
   chatModels?: Record<string, string>
   /**
-   * Managed state, not configuration: how many times each conversation has
-   * started over with `/new`, keyed by the session id it derives at epoch
-   * zero. Absent is the first session, whose id is unchanged.
+   * Managed state, not configuration, and read-only since `/new` began minting
+   * ids: the epoch each conversation used to run on, keyed by the session id it
+   * derives at epoch zero. Nothing writes it any more; it is still read so a
+   * conversation that was moved by the old counter keeps its `--e<N>` session.
    */
   chatEpochs?: Record<string, string>
   /**
-   * Managed state, not configuration: the session each conversation was
-   * explicitly bound to via /session <id>, keyed by conversation key. An
-   * empty-string value marks automatic derivation (the override was reset).
+   * Managed state, not configuration: the session each conversation currently
+   * runs, keyed by its anchor id — the id it derives at the directory it is in,
+   * before any suffix. Written by `/session <id>` (a session that already
+   * exists) and by `/new` (an id minted for the occasion). An empty-string
+   * value marks "run the derived session" (the pointer was cleared).
    */
   chatSessions?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -334,7 +347,40 @@ export interface ResolvedConfig {
   diagnosticsLevel: DiagLevel
 }
 
+/**
+ * The fields the host's settings service may WRITE.
+ *
+ * The host's write path reads `schema.meta.volatile` — its `volatileForm` and
+ * `isVolatilePath` are what refuse a patch to anything else — and the flag is
+ * what makes this channel's managed state durable instead of memory-only.
+ * schemastery exposes it through the `.volatile()` builder from 3.18.4 on, while
+ * this package's declared range starts at 3.18.1, where the metadata exists and
+ * the builder does not; the host reads the metadata, not the method that wrote
+ * it, so it is set below.
+ *
+ * Nothing outside this list is volatile on purpose: `cwd`, `workspaceRoots`,
+ * `model` and the switches are read while the agent is being built, so editing
+ * one live is a decision that needs the row to remount — which is exactly what
+ * the host means by leaving a field non-volatile. `chatEpochs` stays on the list
+ * although nothing writes it any more: it is still read as state, and keeping it
+ * writable is what lets an operator repair a stored conversation by hand.
+ */
+const VOLATILE_FIELDS = [
+  'appId',
+  'appSecret',
+  'appSecretRef',
+  'chatWorkspaces',
+  'chatModels',
+  'chatEpochs',
+  'chatSessions',
+] as const
+
 /** Loader-visible configuration schema and defaults. */
+// The annotation is kept for callers, with one cast behind it: schemastery's
+// inferred output types an optional field as required, and
+// `exactOptionalPropertyTypes` refuses the annotation for exactly that
+// difference — a fact about the type rather than about the values, since
+// `resolveConfig` is what supplies every absent one.
 export const Config: z<Config> = z.object({
   instance: z.string(),
   appId: z.string(),
@@ -370,7 +416,15 @@ export const Config: z<Config> = z.object({
   diagnoseSessions: z.boolean().default(false),
   diagnosticsFile: z.string(),
   diagnosticsLevel: z.union(['debug', 'info', 'warn', 'error'] as const).default('warn'),
-})
+}) as unknown as z<Config>
+
+// Marked after construction rather than inside the literal: the fluent chain is
+// what gives this object its precise schema type, and a helper call in the middle
+// of it widens the inferred output just enough to stop satisfying `Config`.
+{
+  const dict = (Config as unknown as { dict: Record<string, { meta: object }> }).dict
+  for (const key of VOLATILE_FIELDS) Object.assign(dict[key]!.meta, { volatile: true })
+}
 
 /**
  * Resolve the same defaults for direct callers that bypass Cordis Loader.
