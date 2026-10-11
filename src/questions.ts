@@ -84,6 +84,15 @@ export interface QuestionAnswer {
 export interface ChatQuestionBatch {
   /** The conversation whose cards this batch owns. */
   readonly sessionId: string
+  /**
+   * The question ids this batch opened cards for.
+   *
+   * A batch is what a settlement belongs to. A model writes question ids and
+   * reuses them across batches, so matching a settlement against every open
+   * card of a conversation by id alone would settle an older batch's card with
+   * a newer batch's answers; this set is the batch's own membership.
+   */
+  readonly questionIds: readonly string[]
   /** Whether another surface has already answered the batch. */
   decided: boolean
 }
@@ -388,13 +397,23 @@ export class ChatQuestions {
    * before it opens a card for a question the other surface has already
    * answered. A batch claimed mid-flight therefore has fewer cards than
    * questions, which is correct — the remaining ones were never shown.
+   *
+   * Only this batch's own cards are touched: membership is the ids the batch
+   * opened, not every card the conversation happens to hold. A model reuses
+   * question ids, so matching a settlement against the conversation at large
+   * would settle an older batch's card with this batch's answers.
    * @param run - the batch being offered, marked decided by this call.
    * @param answers - the answers the other surface gave, by question id.
    */
   settleElsewhere(run: ChatQuestionBatch, answers: readonly QuestionAnswer[]): void {
     run.decided = true
+    const own = new Set(run.questionIds)
     for (const [id, entry] of this.pending) {
       if (entry.sessionId !== run.sessionId || entry.settled) continue
+      // Only the cards THIS batch opened. Another batch's card in the same
+      // conversation is a different request, and closing it here would paint
+      // answers nobody gave it onto a question that is still waiting.
+      if (!own.has(entry.question.id)) continue
       const settled = answers.find(candidate => candidate.id === entry.question.id)
         ?? { id: entry.question.id, selected: [] }
       this.finish(id, settled, false, shownAnswer(settled), true, true)

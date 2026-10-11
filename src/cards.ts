@@ -908,6 +908,20 @@ const MODEL = {
   },
   summary: { zh: '模型：%s', en: 'Model: %s' },
 }
+/**
+ * What this channel tells a chat whose session the host has archived.
+ *
+ * One string for both surfaces: the refusal a message draws and the status
+ * row that warns about it say the same thing, so the card can never promise a
+ * route the drive path then refuses. Markdown-free on purpose — the card
+ * renders it through `plain_text`, which shows backticks and asterisks
+ * literally.
+ */
+export const ARCHIVED_SESSION_NOTICE: Copy = {
+  zh: '这个会话已被归档，无法继续。请在网页端恢复它，或发 /new 开一个新会话。',
+  en: 'This session is archived, so it cannot run. Restore it in the web UI, or send /new for a new one.',
+}
+
 const STATUS = {
   title: { zh: '本会话状态', en: 'This conversation' },
   subtitle: { zh: '你的下一条消息会怎么跑', en: 'What your next message will do' },
@@ -915,6 +929,7 @@ const STATUS = {
   model: { zh: '模型', en: 'Model' },
   session: { zh: '会话', en: 'Session' },
   activity: { zh: '当前', en: 'Activity' },
+  archived: { zh: '归档', en: 'Archived' },
   version: { zh: '版本', en: 'Version' },
   preset: { zh: '权限', en: 'Permissions' },
   presetOpen: { zh: '不沙箱，且不再弹审批卡', en: 'no sandbox, and no approval cards' },
@@ -1032,6 +1047,13 @@ export function statusCard(input: {
   readonly routeIsDefault: boolean
   readonly sessionId: string
   readonly activity: 'running' | 'idle' | 'unbound' | 'switched'
+  /**
+   * Whether the host archived this session. Rendered as its own row rather
+   * than folded into {@link activity}: the two are orthogonal facts, and the
+   * activity vocabulary answers "what is the agent doing" — which stays true
+   * of an archived session that still holds a live, idle agent.
+   */
+  readonly archived?: boolean | undefined
   readonly pendingApprovals: number
   readonly version: string
   /** The permission preset in force, as the deployment defines it. */
@@ -1044,6 +1066,10 @@ export function statusCard(input: {
       ...field(STATUS.workspace, input.workspace, input.workspaceIsDefault ? STATUS.isDefault : undefined, true),
       ...field(STATUS.model, input.route, input.routeIsDefault ? STATUS.isDefault : undefined),
       ...field(STATUS.activity, STATUS[input.activity]),
+      // Named where it changes what happens next, which is the whole point of
+      // this card: an archived session answers every message with a refusal,
+      // so a row reading "Idle" alone would be the card's one lie.
+      ...input.archived === true ? field(STATUS.archived, ARCHIVED_SESSION_NOTICE) : [],
       ...input.preset === undefined
         ? []
         // Named where someone looks for it: a session that stopped asking

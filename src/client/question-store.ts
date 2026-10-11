@@ -14,7 +14,7 @@
 
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
-import type { SettledQuestion } from './question-decisions.ts'
+import type { SettledQuestion, SettledQuestionSpec } from './question-decisions.ts'
 import type { QuestionDraftAnswer } from './question-drafts.ts'
 import type { SettledSourceRegistry } from './decisions-source.ts'
 
@@ -254,28 +254,91 @@ export function answerBatchOf(
 }
 
 /**
- * The log identities a panel should retire without waiting for a press.
+ * Whether one settled call asked exactly the questions a panel presents.
  *
- * The fold has already narrowed itself to the one call this conversation is
- * presenting, so every settled item it carries is this panel's answer. A
- * request the Client no longer presents needs nothing: the shipped class
+ * This is the correlation a blocking question has to use, because the request
+ * carries no call id: the batch's own questions — how many, their ids, their
+ * texts, their headings, their option labels in order, and whether more than
+ * one could be chosen — are the only identity both sides share. Ids alone would
+ * not do: a model writes them and reuses them across batches, so an earlier
+ * batch's settlement would answer a later request that happens to repeat them,
+ * which is the misdelivery this comparison exists to prevent.
+ * @param settled - the questions one settled call asked, in ask order.
+ * @param presented - the questions the panel presents, in ask order.
+ * @returns whether the two are the same ask.
+ */
+export function sameQuestionBatch(
+  settled: readonly SettledQuestionSpec[],
+  presented: readonly QuestionSpec[],
+): boolean {
+  if (settled.length !== presented.length) return false
+  return settled.every((question, index) => {
+    const shown = presented[index]
+    if (shown === undefined) return false
+    if (question.id !== shown.id || question.question !== shown.question) return false
+    if ((question.header ?? '') !== (shown.header ?? '')) return false
+    if (question.multiSelect !== (shown.multiSelect === true)) return false
+    const labels = (shown.options ?? []).map(option => option.label)
+    return labels.length === question.optionLabels.length
+      && labels.every((label, position) => label === question.optionLabels[position])
+  })
+}
+
+/**
+ * The settled call that answers the questions one panel presents, if the log
+ * holds one.
+ *
+ * The newest match wins: the same batch asked twice can only be told apart by
+ * the later call's own result being in the same window, because a settlement
+ * this window does not hold cannot be considered at all — the window is a page
+ * of the conversation, and a call that fell out of it is invisible here.
+ * Nothing matched means nothing to retire — the panel then waits for a press
+ * exactly as the shipped one does, which is the honest read of a log that does
+ * not describe this request.
+ * @param settled - settled calls from the conversation's window, oldest first.
+ * @param presented - the questions the panel presents, in ask order.
+ * @returns the matching settlement, or undefined when none answers this request.
+ */
+export function settledForQuestions(
+  settled: readonly SettledQuestion[],
+  presented: readonly QuestionSpec[],
+): SettledQuestion | undefined {
+  for (let index = settled.length - 1; index >= 0; index -= 1) {
+    const candidate = settled[index]
+    if (candidate !== undefined && sameQuestionBatch(candidate.questions, presented)) return candidate
+  }
+  return undefined
+}
+
+/** The settlement one panel retires without waiting for a press. */
+export interface ElsewhereRetirement {
+  /** The `tool/call` identity to record as settled by another surface. */
+  readonly callId: string
+  /** The batch the log recorded, which is what the card closes with. */
+  readonly answers: readonly QuestionAnswerItem[]
+}
+
+/**
+ * What one panel retires, given the log's settled calls and the request it
+ * presents.
+ *
+ * A request the Client no longer presents needs nothing: the shipped class
  * rejects a second settlement, which is the expected outcome here rather than a
- * failure.
- *
- * A review card presents a call that already settled — its own recorded answers
- * ARE the settlement — so it retires nothing.
- * @param settled - the settled call matching this panel, if any.
+ * failure. A review card presents a call that already settled — its own
+ * recorded answers ARE the settlement — so it retires nothing.
+ * @param settled - settled calls from the conversation's window, oldest first.
+ * @param presented - the questions the panel presents, in ask order.
  * @param pending - the request the Client currently presents, if any.
- * @returns the identities to record, empty when there is nothing to retire.
+ * @returns the settlement to retire, or undefined when there is nothing to retire.
  */
 export function retirementForQuestion(
   settled: readonly SettledQuestion[],
+  presented: readonly QuestionSpec[],
   pending: AnswerableQuestion | undefined,
-): readonly string[] {
-  if (settled.length === 0) return []
-  if (pending === undefined) return []
-  if (pending.review !== undefined) return []
-  return settled.map(question => question.callId)
+): ElsewhereRetirement | undefined {
+  if (pending === undefined || pending.review !== undefined) return undefined
+  const match = settledForQuestions(settled, presented)
+  return match === undefined ? undefined : { callId: match.callId, answers: match.answers }
 }
 
 /**

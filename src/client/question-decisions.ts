@@ -10,12 +10,14 @@
  * reach the other, which is the same reason the approval half folds the audit
  * pair instead of waiting for a Host event.
  *
- * Only the MOST RECENT call is read. The blocking tool holds the turn until an
- * answer arrives, so at most one `ask_user_question` call is unanswered at a
- * time: the last one in the window is the question this page is presenting, and
- * every earlier one is history that must not retire a live panel. That rule is
- * also why a call id is not the correlation key here — the blocking request
- * carries no `wait`, so the presented card has no call id to match against.
+ * Every settled call is reported, each carrying the questions it asked and the
+ * answers it recorded. Correlation belongs to the consumer, not here: a
+ * blocking request carries no call id, so the batch's own questions are the
+ * only identity a panel and a call can be matched by, and this fold exists to
+ * hand both sides of that comparison over. Reporting only the newest call — the
+ * rule this fold used to follow — cannot do it: a question answered while a
+ * later one stands open is then invisible, and the panel left behind by it is
+ * never retired.
  * @module dsh-lark-channel/client/question-decisions
  */
 
@@ -35,54 +37,129 @@ export interface SettledQuestionAnswer {
   readonly custom?: string | undefined
 }
 
+/**
+ * One question of a settled call, reduced to the facts that identify its batch.
+ *
+ * A panel holds the same questions — the Host handed it the request it parsed
+ * from the same arguments — so a comparison over exactly these members is what
+ * says whether a settled call and a presented request are the same ask. Ids
+ * alone are not enough: a model writes them, and it reuses them across batches,
+ * so an earlier batch's settlement would answer a later request that happens to
+ * repeat them.
+ */
+export interface SettledQuestionSpec {
+  /** The asker's own question id. */
+  readonly id: string
+  /** The question as it was asked. */
+  readonly question: string
+  /** Short heading the asker grouped it under, when it gave one. */
+  readonly header?: string | undefined
+  /** Option labels, in the order the asker offered them. */
+  readonly optionLabels: readonly string[]
+  /** Whether more than one option could be chosen. */
+  readonly multiSelect: boolean
+}
+
 /** One settled question call, as the browser half needs to know it. */
 export interface SettledQuestion {
   /** The `tool/call` identity this answer closes. */
   readonly callId: string
+  /** The questions this call asked, in ask order. */
+  readonly questions: readonly SettledQuestionSpec[]
   /** The answers the call settled with, one entry per question. */
   readonly answers: readonly SettledQuestionAnswer[]
 }
 
 /**
- * Fold one session's event window into the question call this page is showing
- * that somebody else already answered.
+ * Fold one session's event window into every question call the log settled.
+ *
+ * The window is scanned in full on every read because it is an in-memory array,
+ * and because a partial fold would have to track which calls were already
+ * consumed — state that buys nothing for a few hundred entries. A call is
+ * settled when its own result recorded a successful answer batch; the
+ * identities this browser settled itself are excluded by the caller.
  * @param window - the conversation's current event window.
  * @param answeredHere - call identities this browser answered itself.
- * @returns the settled call this browser did not decide, or empty.
+ * @returns settled calls in log order, oldest first.
  */
 export function foldSettledQuestions(
   window: SessionEventWindow,
   answeredHere: ReadonlySet<string>,
 ): readonly SettledQuestion[] {
-  const latest = latestCallId(window)
-  if (latest === undefined || answeredHere.has(latest)) return []
+  const asked = new Map<string, readonly SettledQuestionSpec[]>()
+  const settled: SettledQuestion[] = []
   for (const entry of window.entries) {
     const event = eventOf(entry)
-    if (event?.type !== 'tool/result') continue
-    if (event.data.message.toolCallId !== latest) continue
+    if (event === undefined) continue
+    if (event.type === 'tool/call') {
+      if (event.data.name !== ASK_USER_QUESTION_TOOL) continue
+      asked.set(event.data.callId, questionsOf(event.data.arguments))
+      continue
+    }
+    if (event.type !== 'tool/result') continue
+    const callId = event.data.message.toolCallId
+    const questions = asked.get(callId)
+    // A result for a call this window does not hold is not a settlement it can
+    // describe: without the questions there is nothing to match a panel against.
+    if (questions === undefined || questions.length === 0) continue
+    if (answeredHere.has(callId)) continue
     // A failed call answered nobody: there is no decision to show, and the
     // request it belonged to is the one the Host already gave up on.
-    if (event.data.error !== undefined || event.data.message.isError === true) return []
+    if (event.data.error !== undefined || event.data.message.isError === true) continue
     const answers = answersOf(event.data.message.content)
-    return answers === undefined ? [] : [{ callId: latest, answers }]
+    if (answers === undefined) continue
+    settled.push({ callId, questions, answers })
   }
-  return []
+  return settled
 }
 
 /**
- * The `tool/call` identity of the newest question this conversation asked.
- * @param window - the conversation's current event window.
- * @returns the call id, or undefined when no question was ever asked.
+ * The questions one logged `ask_user_question` call asked.
+ *
+ * Read structurally rather than through a schema: this runs in the browser
+ * against arguments the Host wrote, and a call whose arguments do not parse is
+ * a call no panel can be matched against — reported as asking nothing, which
+ * settles nothing.
+ * @param argumentsText - the call's arguments, as the log recorded them.
+ * @returns the questions, empty when the arguments carry none this reader can use.
  */
-function latestCallId(window: SessionEventWindow): string | undefined {
-  let latest: string | undefined
-  for (const entry of window.entries) {
-    const event = eventOf(entry)
-    if (event?.type !== 'tool/call') continue
-    if (event.data.name !== ASK_USER_QUESTION_TOOL) continue
-    latest = event.data.callId
+function questionsOf(argumentsText: string): readonly SettledQuestionSpec[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(argumentsText)
+  } catch (error) {
+    // Arguments that are not JSON carry no question this reader can name.
+    void error
+    return []
   }
-  return latest
+  const questions = (parsed as { questions?: unknown } | null | undefined)?.questions
+  if (!Array.isArray(questions)) return []
+  return questions.flatMap((entry) => {
+    if (typeof entry !== 'object' || entry === null) return []
+    const record = entry as {
+      id?: unknown
+      question?: unknown
+      header?: unknown
+      options?: unknown
+      multi_select?: unknown
+      multiSelect?: unknown
+    }
+    if (typeof record.id !== 'string' || typeof record.question !== 'string') return []
+    const options = Array.isArray(record.options) ? record.options : []
+    return [{
+      id: record.id,
+      question: record.question,
+      ...typeof record.header === 'string' ? { header: record.header } : {},
+      optionLabels: options.flatMap((option) => {
+        if (typeof option !== 'object' || option === null) return []
+        const label = (option as { label?: unknown }).label
+        return typeof label === 'string' ? [label] : []
+      }),
+      // The blocking tool's schema spells the flag `multi_select`; the timed
+      // one's arguments reach here as the Host parsed them.
+      multiSelect: record.multi_select === true || record.multiSelect === true,
+    }]
+  })
 }
 
 /**

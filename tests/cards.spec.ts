@@ -410,6 +410,39 @@ describe('settled session picker', () => {
   })
 })
 
+describe('status card', () => {
+  /** The report's fields, as a conversation that is merely idle would resolve them. */
+  const fields = {
+    workspace: '/w',
+    workspaceIsDefault: true,
+    route: 'p/m',
+    routeIsDefault: true,
+    sessionId: 's',
+    activity: 'idle' as const,
+    pendingApprovals: 0,
+    version: '',
+    refresh: {},
+  }
+
+  it('names an archived session, because that is what the next message meets', () => {
+    // Orthogonal to the activity row: archiving leaves a live agent bound and
+    // idle, and the host's gate then refuses every step — so "Idle" alone is
+    // the one answer this card must not give.
+    const texts = cardTexts(statusCard({ ...fields, archived: true })).map((text) => text.content)
+
+    expect(texts).toContain('归档')
+    expect(texts).toContain('空闲')
+    expect(texts.some((text) => text.includes('已被归档'))).toBe(true)
+  })
+
+  it('omits the row where nothing is archived, including a deployment that cannot know', () => {
+    const texts = cardTexts(statusCard(fields)).map((text) => text.content)
+
+    expect(texts).not.toContain('归档')
+    expect(texts.some((text) => text.includes('已被归档'))).toBe(false)
+  })
+})
+
 describe('localization', () => {
   /**
    * Every card this module builds, in every state it has. Borrowed values are
@@ -488,6 +521,7 @@ describe('localization', () => {
       routeIsDefault: false,
       sessionId: 's',
       activity: 'running',
+      archived: true,
       pendingApprovals: 2,
       version: '0.0.6',
       preset: { value: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },

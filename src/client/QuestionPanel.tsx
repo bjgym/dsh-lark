@@ -12,8 +12,12 @@
  * On top of that it keeps the one state the shipped panel cannot reach: a
  * request the log shows was already answered by another surface — the Feishu
  * chat, in the deployment this was built for. That request's panel has stopped
- * deciding anything, so this one says so and settles it instead of waiting for
- * a press that would be discarded.
+ * deciding anything, so this one says so and withdraws itself instead of waiting
+ * for a press that would be discarded. The settlement is recognised by the
+ * questions it asked, never by recency: a blocking request carries no call id,
+ * so the batch's own questions are the only identity the log and the presented
+ * request share, and matching on anything looser answers one question with
+ * another's answers.
  *
  * The card state (countdown, wait presentation, channel, closed) comes from the
  * request object's own public observable face. The shipped composer reads the
@@ -240,12 +244,10 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
   // request in the same fold this reads from, so a state derived from that fold
   // would show the record for exactly one render and then drop it — leaving a
   // panel that invites a press on a request somebody already answered, and
-  // losing the "what was actually answered" the record exists to show.
+  // losing the "what was actually answered" the record exists to show. Only the
+  // settlement this panel retires is ever latched here: the record it shows is
+  // the one the log wrote for THIS request.
   const [answeredElsewhere, setAnsweredElsewhere] = useState<readonly QuestionAnswerItem[] | undefined>(undefined)
-  useEffect(() => {
-    if (settled.length === 0) return
-    setAnsweredElsewhere(current => current ?? settled[0]?.answers)
-  }, [settled.length])
   const settledElsewhere = answeredElsewhere !== undefined
   // The log's own record doubles as the display once another surface answered:
   // the card closes showing what was actually answered, never this browser's
@@ -343,19 +345,40 @@ function PanelFlow({ matched, panel, drafts, pending, settled, t }: {
    * chat left behind does not stand waiting for a press that can no longer
    * change anything.
    *
+   * The settlement is correlated with the questions THIS panel presents, never
+   * with recency: the fold reports every settled call, and only the one that
+   * asked this same batch can answer it. A settlement for another batch is
+   * therefore left alone — it is not this request's answer, and retiring it
+   * would both close this panel over somebody else's question and submit that
+   * question's answers here. That is also why this mount is retired only once
+   * the withdrawal below has actually gone through: an unmatched fold, and a
+   * card that could not be settled yet, must not consume it.
+   *
    * The batch submitted here is the one the log recorded, so the panel's own
-   * copy closes showing what was actually answered. A request the Client no
-   * longer presents needs nothing — the shipped class rejects a second
-   * settlement, which is the expected outcome here and not a failure.
+   * copy closes showing what was actually answered — and submitting it is what
+   * withdraws that copy, because the request it settles is the one the Host
+   * already finished and the outcome is dropped there. A card whose channel is
+   * gone cannot be settled, so the withdrawal falls back to the dismissal the
+   * card offers, and a card that refuses both says so rather than standing
+   * there as if it were still waiting for a press.
    */
   useEffect(() => {
     if (retired.current) return
-    const retire = retirementForQuestion(settled, pending)
-    if (retire.length === 0) return
-    retired.current = true
-    for (const requestId of retire) panel.markAnsweredHere(matched.sessionId, requestId)
-    void pending?.answer({ answers: settled[0]?.answers ?? [] }).catch(() => {})
-  }, [settled, pending, panel, matched.sessionId])
+    const retire = retirementForQuestion(settled, questions, pending)
+    if (retire === undefined) return
+    // The record shows while the withdrawal is in flight, so the panel stops
+    // inviting a press the moment the log says somebody else answered.
+    setAnsweredElsewhere(retire.answers)
+    // Only a withdrawal that went through retires this mount, and the log entry
+    // stays in the fold until then: a card that could not be settled yet is
+    // retried the next time the fold moves instead of standing there forever.
+    const withdrawn = (): void => {
+      retired.current = true
+      panel.markAnsweredHere(matched.sessionId, retire.callId)
+    }
+    void pending?.answer({ answers: retire.answers }).then(withdrawn, () =>
+      pending?.dismiss?.().then(withdrawn, () => { setError({ key: 'error.unavailable' }) }))
+  }, [settled, questions, pending, panel, matched.sessionId])
 
   useEffect(() => {
     if (waitDisposition.current === 'waiting') pending?.takeTime?.()

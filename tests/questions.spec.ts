@@ -293,7 +293,10 @@ describe('retiring cards the other surface answered', () => {
     const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
 
-    store.settleElsewhere({ sessionId: 's1', decided: false }, [{ id: 'q-deploy', selected: ['现在部署'] }])
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-deploy'], decided: false },
+      [{ id: 'q-deploy', selected: ['现在部署'] }],
+    )
 
     expect(await pending).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
     await vi.waitFor(() => { expect(updated).toHaveLength(1) })
@@ -307,7 +310,7 @@ describe('retiring cards the other surface answered', () => {
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
 
     store.settleElsewhere(
-      { sessionId: 's1', decided: false },
+      { sessionId: 's1', questionIds: ['q-deploy'], decided: false },
       [{ id: 'q-deploy', selected: [], custom: '等周五再上' }],
     )
 
@@ -321,7 +324,7 @@ describe('retiring cards the other surface answered', () => {
     void store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
 
-    const run = { sessionId: 's1', decided: false }
+    const run = { sessionId: 's1', questionIds: ['q-deploy'], decided: false }
     store.settleElsewhere(run, [])
 
     expect(run.decided).toBe(true)
@@ -332,9 +335,30 @@ describe('retiring cards the other surface answered', () => {
     const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
 
-    store.settleElsewhere({ sessionId: 's1', decided: false }, [{ id: 'someone-else', selected: ['x'] }])
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-deploy'], decided: false },
+      [{ id: 'someone-else', selected: ['x'] }],
+    )
 
     expect(await pending).toEqual({ id: 'q-deploy', selected: [] })
+  })
+
+  it('leaves an older batch\'s card waiting, whatever the answers name', async () => {
+    const { store, sent } = createStore()
+    void store.ask({ sessionId: 's1', chatId: 'oc_1', question: { ...asked, id: 'q-scope' } })
+    const newer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: { ...asked, id: 'q-policy' } })
+    await vi.waitFor(() => { expect(sent).toHaveLength(2) })
+
+    // The batch that was answered is the newer one, and the answers it carries
+    // name the older batch's question id — the collision a model's reused ids
+    // produce. Membership, not the answer ids, decides which card this closes.
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-policy'], decided: false },
+      [{ id: 'q-scope', selected: ['旧'] }, { id: 'q-policy', selected: ['新'] }],
+    )
+
+    expect(await newer).toEqual({ id: 'q-policy', selected: ['新'] })
+    expect(store.awaiting('s1')).toBe(true)
   })
 
   it('leaves another conversation\'s open card waiting', async () => {
@@ -343,7 +367,7 @@ describe('retiring cards the other surface answered', () => {
     void store.ask({ sessionId: 's2', chatId: 'oc_2', question: { ...asked, id: 'q-other' } })
     await vi.waitFor(() => { expect(sent).toHaveLength(2) })
 
-    store.settleElsewhere({ sessionId: 's2', decided: false }, [])
+    store.settleElsewhere({ sessionId: 's2', questionIds: ['q-other'], decided: false }, [])
 
     expect(store.awaiting('s1')).toBe(true)
     expect(store.awaiting('s2')).toBe(false)

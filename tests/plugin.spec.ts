@@ -4065,6 +4065,104 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('refuses an archived session whose agent this chat already drives', async () => {
+      // The case admission exists for: the conversation holds a live agent, so
+      // no rung is ever asked again — and the host's gate would reject every
+      // step of the message that reached it, answering the chat with nothing.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-live-')))
+      const store = createFakeSettings()
+      const first = createFakeWorkspaces()
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { settings: store.settings, workspaces: first.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const bound = harness.agents.created[0]!
+      const turns = bound.agent.followup.mock.calls.length
+      first.service.archivedSessionIds = [bound.sessionId]
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已被归档') })
+      // Refused BEFORE the message reached the agent: a followup here would have
+      // opened a turn the host's gate then ends as `blocked`.
+      expect(bound.agent.followup.mock.calls.length).toBe(turns)
+      expect(harness.agents.created).toHaveLength(1)
+      await harness.dispose()
+    })
+
+    it('names the archived session in /status, and clears it once restored', async () => {
+      // The report promises "what your next message will do", and for an
+      // archived session that is a refusal — so an Idle row would be the one
+      // lie this card tells. Read fresh on every draw, so the refresh follows
+      // the surface that owns the decision.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-status-')))
+      const store = createFakeSettings()
+      const first = createFakeWorkspaces()
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { settings: store.settings, workspaces: first.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const sessionId = harness.agents.created[0]!.sessionId
+      const lastCard = (): string => JSON.stringify(harness.fake.sent.at(-1)!.input)
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(lastCard()).toContain('空闲') })
+      expect(lastCard()).not.toContain('已被归档')
+
+      first.service.archivedSessionIds = [sessionId]
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(lastCard()).toContain('已被归档') })
+      // The row carries the very sentence a refused message draws, so the card
+      // cannot promise a route the drive path then refuses.
+      expect(lastCard()).toContain('请在网页端恢复它')
+
+      first.service.archivedSessionIds = []
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(lastCard()).not.toContain('已被归档') })
+      await harness.dispose()
+    })
+
+    it('explains a blocked turn whose session was archived mid-flight', async () => {
+      // The race admission cannot close: the archive lands after the message was
+      // admitted and before its first step. The gate then ends the turn as
+      // `blocked`, which carries no request and no answer — so the reason is
+      // said here rather than leaving the chat to read silence as a hung bot.
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-arch-blocked-')))
+      const store = createFakeSettings()
+      const first = createFakeWorkspaces()
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { settings: store.settings, workspaces: first.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const session = harness.agents.created[0]!.agent.session
+      first.service.archivedSessionIds = [session.id]
+      const sent = harness.fake.sent.length
+
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end',
+        data: { turn: 1, reason: { kind: 'blocked' } },
+      })
+      await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(sent) })
+      expect(JSON.stringify(harness.fake.sent.at(-1)!.input)).toContain('已被归档')
+
+      // A blocked turn that the archive does NOT explain stays silent: `blocked`
+      // has other producers, and guessing would name the wrong cause.
+      first.service.archivedSessionIds = []
+      const quiet = harness.fake.sent.length
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end',
+        data: { turn: 2, reason: { kind: 'blocked' } },
+      })
+      await new Promise((done) => { setTimeout(done, 20) })
+      expect(harness.fake.sent.length).toBe(quiet)
+      await harness.dispose()
+    })
+
     it('adopts a pointer stored against the bare conversation key', async () => {
       // Before the pointer was keyed by anchor, `/sessions` recorded it against
       // the conversation key and `/cd` cleared it. The stored session must still

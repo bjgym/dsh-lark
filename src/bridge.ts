@@ -18,6 +18,7 @@ import type {
 } from '@larksuite/channel'
 import {
   approvalCard as buildApprovalCard,
+  ARCHIVED_SESSION_NOTICE,
   sessionsCard,
   fileApprovalCard as buildFileApprovalCard,
   QUESTION_SELECT,
@@ -1218,7 +1219,14 @@ export function installBridge(
     request: HostUserQuestionRequest,
     next: () => Promise<HostUserQuestionAnswer>,
   ): Promise<HostUserQuestionAnswer> => {
-    const run: ChatQuestionBatch = { sessionId, decided: false }
+    const run: ChatQuestionBatch = {
+      sessionId,
+      // The batch's own membership: a settlement this channel reports back is
+      // matched against the cards this batch opened, never against every card
+      // the conversation holds.
+      questionIds: request.questions.map(item => item.id),
+      decided: false,
+    }
     const viaChat = askInChat(run, binding, request)
     // Rejection is the chain reporting that nobody claimed the question, so the
     // Web branch drops out rather than failing the whole ask.
@@ -1390,25 +1398,41 @@ export function installBridge(
    */
   const resumeFailure = new Map<string, string>()
 
+  /**
+   * Refuse one id the host has archived, in the chat's own words.
+   *
+   * Archiving is another surface's deliberate decision — the workspace registry
+   * hides such a session from every grouping surface, and the host's archive
+   * gate rejects every step it proposes. Restoring it here would overrule that
+   * decision silently, to a chat that asked for nothing of the kind, and
+   * opening an agent under it anyway would write over the session being
+   * refused; so the refusal is terminal and reported instead.
+   *
+   * Asked by the ladder's admission point on every acquisition AND by the
+   * resume rung. The rung alone is not enough: it is never reached for a
+   * conversation whose binding is already live, and that is precisely the case
+   * this channel created by driving a session another surface then archived.
+   * @param sessionId - the session about to be driven.
+   * @throws {SessionRefusedError} always, when the id is archived.
+   */
+  const refuseArchived = (sessionId: string): void => {
+    if (!archivedSessions().has(sessionId)) return
+    report(`lark-channel: refused the archived session ${sessionId}`)
+    throw new SessionRefusedError(ARCHIVED_SESSION_NOTICE.zh)
+  }
+
   const ladder: SessionLadder = {
+    admit: (sessionId) => { refuseArchived(sessionId) },
     lookup: (sessionId) => {
       const agent = agents.get(sessionId)
       // An agent another owner published is theirs to dispose.
       return agent === undefined ? undefined : { agent, dispose: () => Promise.resolve() }
     },
     resume: async (sessionId) => {
-      // An archived session must not run until someone restores it, and the
-      // host enforces that by rejecting every step it proposes. Restoring it
-      // here would be this channel overruling a decision another surface made
-      // — and doing it silently, to a chat that asked for nothing of the kind —
-      // so the refusal is reported instead. It is terminal: the ladder's next
-      // rung would otherwise CREATE an agent under the very id being refused.
-      if (archivedSessions().has(sessionId)) {
-        report(`lark-channel: refused the archived session ${sessionId}`)
-        throw new SessionRefusedError(
-          '这个会话已被归档，无法继续。\n请在网页端恢复它，或发 `/new` 开一个新会话。',
-        )
-      }
+      // The walk's own guard, narrower than admission: an archive that landed
+      // while this acquisition was already under way is caught here, before a
+      // log is opened and an agent made under an id the gate will refuse.
+      refuseArchived(sessionId)
       const composition = await compositionFor(sessionId)
       try {
         const handle = await agents.resume({
@@ -1818,6 +1842,10 @@ export function installBridge(
       // the card's own `unbound` wording is what says so.
       switched: pointed !== undefined && !isFreshSessionId(pointed),
       running: runningBySession.get(sessionId) === true,
+      // Read every time rather than remembered: the archive set is the host's
+      // live state, another surface may lift it the moment after this card is
+      // drawn, and the card's refresh button is how a reader asks again.
+      archived: archivedSessions().has(sessionId),
       pendingApprovals: [...pendingApprovals.values()]
         .filter(pending => pending.chatId === subject.chatId).length,
       version: pluginVersion,
@@ -3849,7 +3877,16 @@ export function installBridge(
     }
     // AFTER the renderer: the turn's own closing output (the answer, a failure
     // line) still deserves its target; only what comes later must not.
-    if (isTurnEndEvent(event)) aimAt(session.id, binding, undefined)
+    if (isTurnEndEvent(event)) {
+      aimAt(session.id, binding, undefined)
+      // A turn the host refused carries no request and no answer, so the chat
+      // would otherwise just see its own message unanswered. `blocked` has other
+      // producers — any pre-step rejection ends a turn that way — so the archive
+      // set is what decides whether the archive is the account of this one.
+      if (event.data.reason.kind === 'blocked' && archivedSessions().has(session.id)) {
+        void port.send(binding.chatId, { text: ARCHIVED_SESSION_NOTICE.zh }).catch(reportSendFailure)
+      }
+    }
   })
 
   // Structured questions are offered on both surfaces at once, exactly as

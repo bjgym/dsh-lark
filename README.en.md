@@ -52,7 +52,7 @@ pnpm install
 pnpm build
 ```
 
-`pnpm build` emits `lib/index.js`, `lib/cli.js`, `lib/invariant.js`, and the browser half's `lib/client.js`. Do not substitute `pnpm run prepare`: it emits only the three host entries and no browser half.
+`pnpm build` emits `lib/index.js`, `lib/cli.js`, `lib/invariant.js`, and the browser half's `lib/client.js`. `pnpm run prepare` — the path a Git or tarball install takes, which `pnpm install` also runs — emits the same set: the Host declarations, the Client face's declarations and JavaScript, and the same `lib/client.js`. The only difference is that it clears `lib/` and rebuilds everything, so day-to-day edits are faster with `pnpm build`.
 
 **3. Install into a profile.** `dsh plugin` forwards its arguments to pnpm inside the profile directory, and a relative path is resolved against the directory you run it from; a profile that does not exist yet is initialized with `@deepseek-ai/dsh-base`, and because this package declares `dsh.bundle` it is appended to `dsh.profile.bundles` as a link to this checkout:
 
@@ -118,7 +118,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
 | Cards that ask | Single or multiple choice, or type an answer; approve a plan or send feedback; allow or refuse a tool call |
 | Permission presets | `/permission` opens a picker saying what each preset may touch and whether it still asks; loosening the sandbox needs an approver, tightening it does not |
-| Live status | `/status` shows workspace, model, session, and the permission preset in force — plus context occupancy and token totals where the host meters them — and refreshes in place |
+| Live status | `/status` shows workspace, model, session, and the permission preset in force — plus context occupancy and token totals where the host meters them — and refreshes in place; a session the host archived is named as such, with what the next message will meet |
 | Session scope | One agent per chat, per topic thread, or per person in a shared chat |
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
 | Slash commands | Host commands (`/plan`, `/compact`, …) run straight through the DSH command runtime |
@@ -139,7 +139,7 @@ The card is still sent and the two surfaces still race; when the web answers fir
 
 ### The web-side question panel
 
-A question (`ask_user_question`) likewise appears on both surfaces at once, and the first answer wins: the web copy reads the session log, recognises that another surface already answered, says so, and retires itself — and the closing card displays the log's own record rather than this browser's unfinished drafts, its status strip trading the waiting tone for a completion one. The recognition shares its skeleton with the approval panel — both read through the same settled-source registry — but the keys differ: an approval correlates by tool call (falling back to the tool name when the asker named no call), while a question recognises only the newest `ask_user_question` call, and only when that call left a successful result. Beyond that it reproduces the host's question wizard item by item, so replacing it loses nothing:
+A question (`ask_user_question`) likewise appears on both surfaces at once, and the first answer wins: the web copy reads the session log, recognises that another surface already answered, hands back the batch the log recorded — which is also how it withdraws itself, because the host finished that request long ago and drops the outcome there while this page's copy closes on it — and displays the log's own record rather than this browser's unfinished drafts, its status strip trading the waiting tone for a completion one. The recognition shares its skeleton with the approval panel — both read through the same settled-source registry — but the keys differ: an approval correlates by tool call (falling back to the tool name when the asker named no call), while a question correlates by **the batch's own questions**: count, ids, texts, headings, option labels in order, and the multiple-choice flag must all agree before a settlement counts as this request's. Recency cannot decide it — a blocking request carries no call id, and a model reuses ids across batches, so matching by newest or by id alone answers one question with another's answers (which is what happened: a `scope/depth/format` ask received the previous batch's `dir/scope/ui` answers). Every call in the window that left a successful result is read, and the newest one matching this request wins; a request nothing matches retires nothing and waits for a press exactly as the shipped panel does. When the card's own channel no longer accepts an answer, the withdrawal falls back to the dismissal the card offers; a card that refuses both says so instead of standing there as if it were still waiting. Beyond that it reproduces the host's question wizard item by item, so replacing it loses nothing:
 
 - One question per page with a pager, previous/next, and collapsing the whole card;
 - Skipping a question, answer validation, and the submission lock;
@@ -156,7 +156,7 @@ The card is still sent and the two surfaces still race; when the web answers fir
 
 | Command | What it does |
 |---|---|
-| `/status` | Show and refresh workspace, model, and session; context and tokens where available |
+| `/status` | Show and refresh workspace, model, and session; context and tokens where available; an archived session is named, because the next message is refused until it is restored |
 | `/ws` | Open the workspace picker; one press switches |
 | `/cd <name or path>` | Switch this conversation's workspace |
 | `/get <path>` | Send a workspace file to the chat; in a group it asks the room first, and the bytes leave only after someone allows it |

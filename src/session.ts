@@ -124,6 +124,18 @@ export interface OpenedSession {
  */
 export interface SessionLadder {
   /**
+   * Whether this channel may drive one id at all, asked before EVERY
+   * acquisition hands a session out — the live-binding fast path included.
+   *
+   * The rungs below cannot answer this on their own: a conversation whose
+   * binding is already live never reaches `resume`, so a session refused there
+   * would still be driven through the binding it holds. A deployment with
+   * nothing to refuse answers by returning.
+   * @param sessionId - the branded session id about to be driven.
+   * @throws {SessionRefusedError} to refuse the id, with the chat's own words.
+   */
+  admit(sessionId: string): void
+  /**
    * Return the live agent for this id, if the host already has one.
    * @param sessionId - the branded session id.
    * @returns the live handle, or undefined when nothing runs on that id.
@@ -246,6 +258,7 @@ export class ConversationSessions {
    * @param key - the conversation key.
    * @returns the bound session, the same object for every later call of its key.
    * @throws {Error} when this store is closed, or when creation genuinely fails.
+   * @throws {SessionRefusedError} when the ladder refuses the id outright.
    */
   async acquireKey(key: string): Promise<OpenedSession> {
     for (;;) {
@@ -258,6 +271,13 @@ export class ConversationSessions {
         continue
       }
       const generation = this.generation(key)
+      // Re-asked every iteration, because every iteration is a chance for the
+      // world to have moved: a release re-derives the id, and an id admitted
+      // under one state may be refused under the next. Asked HERE rather than
+      // in a rung, because the binding below is handed out without touching a
+      // single rung at all — and a session refused inside `resume` would still
+      // be driven through a binding this conversation already holds.
+      this.ladder.admit(this.idFor(key))
       const bound = this.opened.get(key)
       if (bound !== undefined) {
         // Reusable only while it still IS this key's session: a workspace

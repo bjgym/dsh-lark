@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
-  answerBatchOf, createSubmissionGuard, parseRecommendedLabel, recommendedFirstOption, retirementForQuestion,
+  answerBatchOf, createSubmissionGuard, parseRecommendedLabel, recommendedFirstOption,
+  retirementForQuestion, sameQuestionBatch, settledForQuestions,
 } from '../src/client/question-store.ts'
 import type { AnswerableQuestion, QuestionSpec } from '../src/client/question-store.ts'
 import { createQuestionDrafts } from '../src/client/question-drafts.ts'
 import { foldSettledQuestions } from '../src/client/question-decisions.ts'
+import type { SettledQuestion, SettledQuestionSpec } from '../src/client/question-decisions.ts'
 import type { SessionEventWindow } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
@@ -216,20 +218,99 @@ describe('the draft registry a remount restores from', () => {
 
 describe('what a panel retires when the log shows another surface answered', () => {
   const pending = { answer: async () => {} } satisfies AnswerableQuestion
+  /** One settled call, as the fold reports it. */
+  const settledCall = (questions: readonly SettledQuestionSpec[], answers: SettledQuestion['answers'] = []) =>
+    ({ callId: 'call-1', questions, answers }) satisfies SettledQuestion
+  const askedSpecs: readonly SettledQuestionSpec[] = [
+    { id: 'q1', question: '部署到生产？', optionLabels: ['部署', '取消'], multiSelect: false },
+    { id: 'q2', question: '要不要通知？', optionLabels: ['通知', '不通知'], multiSelect: false },
+  ]
 
-  it('retires the settled call while a request is still presented', () => {
-    expect(retirementForQuestion([{ callId: 'call-1', answers: [] }], pending)).toEqual(['call-1'])
+  it('retires the settled call that asked this very batch', () => {
+    const settled = [settledCall(askedSpecs, [{ id: 'q1', selected: ['部署'] }])]
+
+    expect(retirementForQuestion(settled, asked, pending))
+      .toEqual({ callId: 'call-1', answers: [{ id: 'q1', selected: ['部署'] }] })
   })
 
   it('retires nothing without a settled call, or without a presented request', () => {
-    expect(retirementForQuestion([], pending)).toEqual([])
-    expect(retirementForQuestion([{ callId: 'call-1', answers: [] }], undefined)).toEqual([])
+    expect(retirementForQuestion([], asked, pending)).toBeUndefined()
+    expect(retirementForQuestion([settledCall(askedSpecs)], asked, undefined)).toBeUndefined()
   })
 
   it('retires nothing for a review card, whose own record is the settlement', () => {
     const review = { answer: async () => {}, review: [] } satisfies AnswerableQuestion
 
-    expect(retirementForQuestion([{ callId: 'call-1', answers: [] }], review)).toEqual([])
+    expect(retirementForQuestion([settledCall(askedSpecs)], asked, review)).toBeUndefined()
+  })
+
+  it('retires nothing for a settlement that asked another batch', () => {
+    // The misdelivery this correlation exists to prevent: the previous batch's
+    // answers arrived while THIS one was presented.
+    const previous: readonly SettledQuestionSpec[] = [
+      { id: 'dir', question: '用哪个目录名？', optionLabels: ['a', 'b'], multiSelect: false },
+      { id: 'scope', question: '首版做到什么程度？', optionLabels: ['骨架', '全量'], multiSelect: false },
+      { id: 'ui', question: 'UI 组件库？', optionLabels: ['Element', 'Ant'], multiSelect: false },
+    ]
+
+    expect(retirementForQuestion([settledCall(previous, [{ id: 'dir', selected: ['a'] }])], asked, pending))
+      .toBeUndefined()
+  })
+
+  it('retires nothing when the batch repeats ids but not its questions', () => {
+    // A model reuses ids across batches, so ids alone cannot identify an ask.
+    const reworded: readonly SettledQuestionSpec[] = [
+      { id: 'q1', question: '第一个问题：请选择 A 或 B。', optionLabels: ['A', 'B'], multiSelect: false },
+      { id: 'q2', question: '第二个问题：请选择 A 或 B。', optionLabels: ['A', 'B'], multiSelect: false },
+    ]
+
+    expect(retirementForQuestion([settledCall(reworded)], asked, pending)).toBeUndefined()
+  })
+
+  it('retires the newest of two settlements for the same batch', () => {
+    const older = { callId: 'call-old', questions: askedSpecs, answers: [{ id: 'q1', selected: ['取消'] }] }
+    const newer = { callId: 'call-new', questions: askedSpecs, answers: [{ id: 'q1', selected: ['部署'] }] }
+
+    expect(retirementForQuestion([older, newer], asked, pending)?.callId).toBe('call-new')
+  })
+})
+
+describe('matching a settlement against the questions a panel presents', () => {
+  const specs: readonly SettledQuestionSpec[] = [
+    { id: 'q1', question: '部署到生产？', header: '发布', optionLabels: ['部署', '取消'], multiSelect: false },
+  ]
+
+  it('accepts the same ask', () => {
+    expect(sameQuestionBatch(specs, [
+      { id: 'q1', question: '部署到生产？', header: '发布', options: [{ label: '部署' }, { label: '取消' }] },
+    ])).toBe(true)
+  })
+
+  it('rejects a different count, id, text, header, labels, or choice mode', () => {
+    const presented: QuestionSpec = {
+      id: 'q1', question: '部署到生产？', header: '发布', options: [{ label: '部署' }, { label: '取消' }],
+    }
+
+    expect(sameQuestionBatch(specs, [presented, presented])).toBe(false)
+    expect(sameQuestionBatch(specs, [{ ...presented, id: 'other' }])).toBe(false)
+    expect(sameQuestionBatch(specs, [{ ...presented, question: '部署到预发？' }])).toBe(false)
+    expect(sameQuestionBatch(specs, [{ ...presented, header: undefined }])).toBe(false)
+    expect(sameQuestionBatch(specs, [{ ...presented, options: [{ label: '取消' }, { label: '部署' }] }])).toBe(false)
+    expect(sameQuestionBatch(specs, [{ ...presented, multiSelect: true }])).toBe(false)
+  })
+
+  it('picks the newest matching settlement out of several', () => {
+    const other: SettledQuestion = {
+      callId: 'call-other',
+      questions: [{ id: 'x', question: '别的？', optionLabels: [], multiSelect: false }],
+      answers: [],
+    }
+    const match: SettledQuestion = { callId: 'call-match', questions: specs, answers: [] }
+
+    expect(settledForQuestions([other, match], [
+      { id: 'q1', question: '部署到生产？', header: '发布', options: [{ label: '部署' }, { label: '取消' }] },
+    ])?.callId).toBe('call-match')
+    expect(settledForQuestions([other], [])).toBeUndefined()
   })
 })
 
@@ -238,10 +319,18 @@ function windowOf(events: readonly { type: string; data: unknown }[]): SessionEv
   return { entries: events.map(event => ({ type: 'event', event })) } as unknown as SessionEventWindow
 }
 
-/** One `tool/call` for the question tool. */
-function call(callId: string) {
-  return { type: 'tool/call', data: { turn: 1, step: 1, callId, name: 'ask_user_question', arguments: '{}' } }
+/** One `tool/call` for the question tool, asking one question unless told otherwise. */
+function call(callId: string, questions = [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }] }]) {
+  return {
+    type: 'tool/call',
+    data: { turn: 1, step: 1, callId, name: 'ask_user_question', arguments: JSON.stringify({ questions }) },
+  }
 }
+
+/** The questions one `call` above records, as the fold reports them. */
+const oneQuestion: readonly SettledQuestionSpec[] = [
+  { id: 'q1', question: '部署到生产？', optionLabels: ['部署'], multiSelect: false },
+]
 
 /** One `tool/result` carrying an answer batch. */
 function result(callId: string, answers: readonly { id: string; selected: string[] }[]) {
@@ -255,23 +344,28 @@ function result(callId: string, answers: readonly { id: string; selected: string
   }
 }
 
-describe('folding the question the log shows was answered', () => {
+describe('folding the questions the log shows were answered', () => {
   it('reports nothing while the newest question has no result yet', () => {
     expect(foldSettledQuestions(windowOf([call('call-1')]), new Set())).toEqual([])
   })
 
-  it('reports the newest call\'s answers once its result lands', () => {
+  it('reports the call\'s questions and answers once its result lands', () => {
     const settled = foldSettledQuestions(
       windowOf([call('call-1'), result('call-1', [{ id: 'q1', selected: ['部署'] }])]),
       new Set(),
     )
 
-    expect(settled).toEqual([{ callId: 'call-1', answers: [{ id: 'q1', selected: ['部署'] }] }])
+    expect(settled).toEqual([{
+      callId: 'call-1',
+      questions: oneQuestion,
+      answers: [{ id: 'q1', selected: ['部署'] }],
+    }])
   })
 
-  it('ignores history: only the newest question can retire a live panel', () => {
-    // The blocking tool holds the turn, so at most one question is open. An
-    // older settled call must not be mistaken for this one's answer.
+  it('reports a question answered while a later one stands open', () => {
+    // The masking this fold used to suffer: reading only the newest call hid
+    // every question answered before the model asked again, and the panel those
+    // answers left behind was never retired.
     const settled = foldSettledQuestions(
       windowOf([
         call('call-old'),
@@ -281,7 +375,25 @@ describe('folding the question the log shows was answered', () => {
       new Set(),
     )
 
-    expect(settled).toEqual([])
+    expect(settled).toEqual([{
+      callId: 'call-old',
+      questions: oneQuestion,
+      answers: [{ id: 'q-old', selected: ['旧答案'] }],
+    }])
+  })
+
+  it('reports every settled call in log order, so a panel can match its own', () => {
+    const settled = foldSettledQuestions(
+      windowOf([
+        call('call-1'),
+        result('call-1', [{ id: 'q1', selected: ['部署'] }]),
+        call('call-2', [{ id: 'q2', question: '要不要通知？', options: [{ label: '通知' }] }]),
+        result('call-2', [{ id: 'q2', selected: ['通知'] }]),
+      ]),
+      new Set(),
+    )
+
+    expect(settled.map(question => question.callId)).toEqual(['call-1', 'call-2'])
   })
 
   it('reports nothing for a call this browser answered itself', () => {
@@ -321,6 +433,39 @@ describe('folding the question the log shows was answered', () => {
     }
 
     expect(foldSettledQuestions(windowOf([call('call-1'), noise]), new Set())).toEqual([])
+  })
+
+  it('reports nothing for a result whose call this window does not hold', () => {
+    // Without the call there are no questions, and a settlement that names no
+    // questions can be matched against no panel.
+    expect(foldSettledQuestions(
+      windowOf([result('call-1', [{ id: 'q1', selected: ['部署'] }])]),
+      new Set(),
+    )).toEqual([])
+  })
+
+  it('reports nothing for a call whose arguments carry no questions', () => {
+    const empty = {
+      type: 'tool/call',
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'ask_user_question', arguments: '{}' },
+    }
+
+    expect(foldSettledQuestions(
+      windowOf([empty, result('call-1', [{ id: 'q1', selected: ['部署'] }])]),
+      new Set(),
+    )).toEqual([])
+  })
+
+  it('ignores another tool\'s call, whatever it recorded', () => {
+    const other = {
+      type: 'tool/call',
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{"questions":[]}' },
+    }
+
+    expect(foldSettledQuestions(
+      windowOf([other, result('call-1', [{ id: 'q1', selected: ['部署'] }])]),
+      new Set(),
+    )).toEqual([])
   })
 })
 
