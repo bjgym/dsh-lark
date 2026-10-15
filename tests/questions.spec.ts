@@ -6,7 +6,7 @@ import {
   questionCard,
   SUBMIT_OPTION,
 } from '../src/questions.ts'
-import type { AskedQuestion } from '../src/questions.ts'
+import type { AskedQuestion, QuestionPorts } from '../src/questions.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
 /** One question with two options, as a model would ask it. */
@@ -21,7 +21,7 @@ const asked: AskedQuestion = {
 }
 
 /** A store over an in-memory transport, recording what it sent and repainted. */
-function createStore() {
+function createStore(ports: Partial<Pick<QuestionPorts, 'refuseApprover'>> = {}) {
   const sent: { chatId: string; card: object }[] = []
   const updated: { messageId: string; card: object }[] = []
   const reports: string[] = []
@@ -32,6 +32,7 @@ function createStore() {
     },
     update: async (messageId, card) => { updated.push({ messageId, card }) },
     report: (line) => { reports.push(line) },
+    ...ports,
   })
   return { store, sent, updated, reports }
 }
@@ -214,6 +215,88 @@ describe('ChatQuestions', () => {
     // The press from the chat the card belongs to still counts.
     expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_1' })).toBeDefined()
     expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+  })
+
+  it('gates a question that grants something on the approver rule', async () => {
+    const { store, sent, reports } = createStore({
+      refuseApprover: click => click.operatorId === 'ou_lead' ? undefined : `operator ${String(click.operatorId)} is not in approvers`,
+    })
+    const answer = store.ask({
+      sessionId: 's1',
+      chatId: 'oc_1',
+      question: asked,
+      // A plan review leaves plan mode and starts executing the plan, so the
+      // deployment's approver list decides who may make that press.
+      requiresApprover: true,
+    })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const [first] = buttonsOf(sent[0]!.card)
+
+    // Anyone the chat serves may answer an ordinary question; this one is a
+    // grant, so a member who is not an approver is refused and logged.
+    expect(store.answerByClick(
+      { kind: QUESTION_ACTION, id: first!.id, option: 0 },
+      { chatId: 'oc_1', operatorId: 'ou_bystander' },
+    )).toBeUndefined()
+    expect(store.awaiting('s1')).toBe(true)
+    expect(reports.some(line => line.includes('not in approvers'))).toBe(true)
+
+    // And the named approver's press is the one that settles it.
+    expect(store.answerByClick(
+      { kind: QUESTION_ACTION, id: first!.id, option: 0 },
+      { chatId: 'oc_1', operatorId: 'ou_lead' },
+    )).toBeDefined()
+    expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+  })
+
+  it('leaves an ordinary question open to whoever the chat serves', async () => {
+    const { store, sent } = createStore({
+      refuseApprover: () => 'operator is not in approvers',
+    })
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const [first] = buttonsOf(sent[0]!.card)
+
+    // The rule is asked only where the asker said the question grants
+    // something: an ordinary question is not an escalation.
+    expect(store.answerByClick(
+      { kind: QUESTION_ACTION, id: first!.id, option: 1 },
+      { chatId: 'oc_1', operatorId: 'ou_bystander' },
+    )).toBeDefined()
+    expect(await answer).toEqual({ id: 'q-deploy', selected: ['先跑测试'] })
+  })
+
+  it('repaints the retried card when the question settled during the retry', async () => {
+    const sent: { chatId: string; card: object }[] = []
+    const updated: { messageId: string; card: object }[] = []
+    const reports: string[] = []
+    let attempts = 0
+    let releaseRetry!: () => void
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve })
+    const store = new ChatQuestions({
+      send: async (chatId, card) => {
+        sent.push({ chatId, card })
+        attempts += 1
+        // The first attempt fails before naming a card; the retry is slow, which
+        // is the window the repaint exists for.
+        if (attempts === 1) throw new Error('response lost')
+        await retryGate
+        return `om_q_${attempts}`
+      },
+      update: async (messageId, card) => { updated.push({ messageId, card }) },
+      report: (line) => { reports.push(line) },
+    })
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(2) })
+
+    // Settled while the retry was still in flight: the card the platform is
+    // about to render must not keep offering a press.
+    store.answerByText('s1', 'typed')
+    releaseRetry()
+
+    expect(await answer).toEqual({ id: 'q-deploy', selected: [], custom: 'typed' })
+    await vi.waitFor(() => { expect(updated.map(entry => entry.messageId)).toEqual(['om_q_2']) })
+    expect(reports.some(line => line.includes('retrying once'))).toBe(true)
   })
 
   it('asks nothing at all when the turn was already cancelled', async () => {

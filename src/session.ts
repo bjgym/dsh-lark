@@ -374,6 +374,13 @@ export class ConversationSessions {
       await teardown
     } finally {
       if (this.retiring.get(key) === teardown) this.retiring.delete(key)
+      // The bumped epoch is only ever read by a walk that was already in flight
+      // when it moved, and every one of those has settled by now (the teardown
+      // awaits them). Dropping it once no successor owns the key keeps this map
+      // from growing one entry per conversation that ever started over: a later
+      // walk reads `?? 0` exactly as it would read a number nobody compares
+      // against any more.
+      if (this.opening.get(key) === undefined) this.generations.delete(key)
     }
     return true
   }

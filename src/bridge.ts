@@ -68,7 +68,7 @@ import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
 import { createMessageRenderer, createStreamRenderer, replyOptions } from './outbound.ts'
 import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
-import { refuseApprovalClick, refuseMessage } from './authorization.ts'
+import { refuseApproverOnly, refuseApprovalClick, refuseMessage } from './authorization.ts'
 import {
   cardMarker,
   marked,
@@ -583,6 +583,29 @@ const MAX_QUESTION_SUBMISSIONS = 64
 const MAX_QUESTION_FIELD_CHARS = 12
 
 /**
+ * How many per-key entries one bridge remembers for its own bookkeeping.
+ *
+ * The sets and caches below exist to say a thing ONCE per key — a `.gitignore`
+ * hint per directory, a bot's identity per chat, one workspace lookup per
+ * directory — and a process serving a busy tenant for months would otherwise
+ * accumulate one entry per key for its whole life. The cap is far above any
+ * working set; a "said once" set that reaches it is cleared, which costs at most
+ * a repeated notice and never a wrong answer, and the lookup cache evicts its
+ * oldest entry, which costs a re-resolve.
+ */
+const KEYED_STATE_MAX = 512
+
+/**
+ * Remember one key in a "said once" set, keeping the set bounded.
+ * @param keys - the set of keys already announced.
+ * @param key - the key to remember.
+ */
+function rememberOnce(keys: Set<string>, key: string): void {
+  if (keys.size >= KEYED_STATE_MAX) keys.clear()
+  keys.add(key)
+}
+
+/**
  * The longest speaker name one group message carries into the model's prompt.
  *
  * A display name is its owner's own text and rides the prompt as a line prefix,
@@ -1091,6 +1114,12 @@ export function installBridge(
         notify(`lark-channel: workspace lookup failed for ${path}: ${String(error)}`)
         return undefined
       })
+      // Bounded: the oldest lookup is the one dropped, and dropping it costs a
+      // re-resolve rather than a wrong answer.
+      if (workspaceRecords.size >= KEYED_STATE_MAX) {
+        const oldest = workspaceRecords.keys().next().value
+        if (oldest !== undefined) workspaceRecords.delete(oldest)
+      }
       workspaceRecords.set(path, pending)
     }
     return pending
@@ -1188,6 +1217,12 @@ export function installBridge(
     send: async (chatId, card) => (await port.send(chatId, { card })).messageId,
     update: async (messageId, card) => { await port.updateCard(messageId, card) },
     report: notify,
+    // The approver rule a question that GRANTS something faces. Read through
+    // `authorization` at press time, so a deployment that narrowed approvals
+    // narrows the plan review with the same list — and a deployment that named
+    // no approvers keeps the ordinary rule, where whoever may drive the chat may
+    // answer it. The chat itself is already checked by the store.
+    refuseApprover: click => refuseApproverOnly(authorization, click),
   })
 
   /**
@@ -1298,6 +1333,10 @@ export function installBridge(
         chatId: binding.chatId,
         question: planReviewQuestion(heading),
         ...signal === undefined ? {} : { signal },
+        // Approving a plan leaves plan mode and starts executing it, so the
+        // press is a grant rather than an answer: a deployment that named
+        // approvers has said who may make it.
+        requiresApprover: true,
       })
       return { selected: answer.selected, ...answer.custom === undefined ? {} : { custom: answer.custom } }
     },
@@ -1620,7 +1659,18 @@ export function installBridge(
     bindingGenerations.set(watch, (bindingGenerations.get(watch) ?? 0) + 1)
     // Dropped from the creation cache as well, so a later `bindingFor` on this
     // pair builds a renderer of its own instead of handing back this one.
+    const abandoned = bindings.get(watch)
     bindings.delete(watch)
+    // The bumped generation is read by exactly one party: a creation that was
+    // already in flight for this pair, which compares it to the number it
+    // captured. Once that creation has settled — and no successor has taken the
+    // slot since, whose own baseline is the bumped number — the entry answers
+    // nothing, so it is dropped rather than kept for the process's lifetime.
+    const drop = (): void => {
+      if (bindings.get(watch) === undefined) bindingGenerations.delete(watch)
+    }
+    if (abandoned === undefined) drop()
+    else void abandoned.then(drop, drop)
     const binding = bySession.get(left)
     // Another chat's watch on the same session is that chat's to give up.
     if (binding === undefined || binding.chatId !== chatId) return
@@ -1713,6 +1763,17 @@ export function installBridge(
    */
   const getHeldText = (fileName: string): string =>
     `📎 已就 \`${fileName}\` 发起审批：群里发文件要房间同意，通过后就会发出来。`
+
+  /**
+   * What a group is told when its `/get` cannot even be offered yet.
+   *
+   * The cap is per chat and counts everything outstanding in it — the model's
+   * own offers and this room's own commands alike — so the sentence names the
+   * one thing a person can act on: decide what is already waiting.
+   * @returns the message text.
+   */
+  const getBusyText = (): string =>
+    `⏳ 这个群已经有 ${MAX_PENDING_FILE_SENDS} 个文件在等审批，先决定完再发。`
 
   /** What the chat is told when a switch landed. */
   const presetSwitchedText = (preset: string): string =>
@@ -2032,7 +2093,7 @@ export function installBridge(
         // and repeating it for every message would bury the rest of the log.
         const seen = `${msg.chatId}/${verdict.senderId}`
         if (!reportedBots.has(seen)) {
-          reportedBots.add(seen)
+          rememberOnce(reportedBots, seen)
           notify(strangerNotice(verdict.senderId, msg.chatId))
         }
         return
@@ -2043,7 +2104,7 @@ export function installBridge(
         // a fact worth seeing, and here the answer is "a bot".
         const seen = `${msg.chatId}/${msg.senderId}`
         if (!reportedBots.has(seen)) {
-          reportedBots.add(seen)
+          rememberOnce(reportedBots, seen)
           notify(servedNotice(msg.senderId, msg.chatId))
         }
       }
@@ -2085,43 +2146,63 @@ export function installBridge(
         // would throw away a live context to send an attachment.
         if (channelCommand === GET_COMMAND) {
           const workspace = chatWorkspaces.pathFor(key)
-          // Read and cleared BEFORE anything is offered, so a refusal and a
-          // read failure both answer immediately — and so the bytes a room is
-          // asked about are the bytes that leave, exactly as in `deliverFile`.
-          const target = await readGetTarget(msg.content, workspace, config.maxSendFileBytes)
-          if (!target.ok) {
-            await port.send(msg.chatId, { markdown: target.reply }).catch(reportSendFailure)
+          // A group's `/get` holds the same slot the model's send does, and it
+          // is taken BEFORE the read: the bytes are read before anyone is asked,
+          // so a room with its cards already outstanding refuses the next
+          // command without spending a read or another buffer — which is
+          // exactly the bound `deliverFile` keeps for the model's own sends.
+          const gated = msg.chatType !== 'p2p'
+          if (gated && !holdFileSend(msg.chatId)) {
+            await port.send(msg.chatId, { text: getBusyText() }).catch(reportSendFailure)
             return
           }
-          // A direct message goes straight out (ADR 0002): its only reader is
-          // the person authorized to drive this agent, who could have asked for
-          // the contents on screen instead. A GROUP does not: the bytes land in
-          // a room, and every other file that reaches a room passes an approval
-          // card — so a human's `/get` takes the gate the model's `send_file`
-          // takes, and the room decides.
-          //
-          // The gate is NOT awaited here. This runs inside the transport's
-          // per-chat queue, and a card click arrives through that same queue
-          // (the SDK serializes a chat's messages and its card actions on one
-          // tail), so awaiting it would deadlock the very press it waits for.
-          if (msg.chatType !== 'p2p') {
-            const binding = bySession.get(sessionIdOf(key))
-            spawn(offerGetInGroup(
-              binding ?? { chatId: msg.chatId, chatType: msg.chatType },
+          // Released by whoever ends up holding the bytes: this arm releases on
+          // every early return, and the gated arm hands the claim to the spawned
+          // task, which releases it when the room is done with it.
+          let held = gated
+          try {
+            // Read and cleared BEFORE anything is offered, so a refusal and a
+            // read failure both answer immediately — and so the bytes a room is
+            // asked about are the bytes that leave, exactly as in `deliverFile`.
+            const target = await readGetTarget(msg.content, workspace, config.maxSendFileBytes)
+            if (!target.ok) {
+              await port.send(msg.chatId, { markdown: target.reply }).catch(reportSendFailure)
+              return
+            }
+            // A direct message goes straight out (ADR 0002): its only reader is
+            // the person authorized to drive this agent, who could have asked
+            // for the contents on screen instead. A GROUP does not: the bytes
+            // land in a room, and every other file that reaches a room passes an
+            // approval card — so a human's `/get` takes the gate the model's
+            // `send_file` takes, and the room decides.
+            //
+            // The gate is NOT awaited here. This runs inside the transport's
+            // per-chat queue, and a card click arrives through that same queue
+            // (the SDK serializes a chat's messages and its card actions on one
+            // tail), so awaiting it would deadlock the very press it waits for.
+            if (gated) {
+              // The room asked is the room the command came from, never the chat
+              // the session happens to be bound to: a conversation can be adopted
+              // by another chat through `/sessions`, and sending a file the first
+              // room asked for into the second would move its contents across
+              // rooms with nobody saying so.
+              const chat: GateChat = { chatId: msg.chatId, chatType: msg.chatType }
+              held = false
+              spawn(offerGetInGroup(chat, target.file, target.bytes, msg)
+                .finally(() => { releaseFileSend(chat.chatId) }))
+              await port.send(msg.chatId, { text: getHeldText(target.file.fileName) }).catch(reportSendFailure)
+              return
+            }
+            await sendGetFile(
+              { chatId: msg.chatId, chatType: msg.chatType },
               target.file,
               target.bytes,
               msg,
-            ))
-            await port.send(msg.chatId, { text: getHeldText(target.file.fileName) }).catch(reportSendFailure)
+            )
             return
+          } finally {
+            if (held) releaseFileSend(msg.chatId)
           }
-          await sendGetFile(
-            { chatId: msg.chatId, chatType: msg.chatType },
-            target.file,
-            target.bytes,
-            msg,
-          )
-          return
         }
         // Dispose the conversation's current agent so the next message walks
         // the ladder again — under a new id after `/cd`, or resuming the same
@@ -2241,7 +2322,7 @@ export function installBridge(
           report: notify,
           hintWorkspace: !hintedWorkspaces.has(workspace),
         })
-        if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
+        if (inbound.landed.length > 0) rememberOnce(hintedWorkspaces, workspace)
         images = await collectImages(
           msg,
           port,
@@ -2601,6 +2682,10 @@ export function installBridge(
    * Off the message queue by construction (the caller spawns it): the card is
    * settled by a click that arrives on that same queue, so waiting for it there
    * would be waiting for something this chat cannot deliver.
+   *
+   * The caller owns the chat's file-send slot for as long as this runs, and
+   * releases it when this settles: the buffer carried here is exactly what that
+   * bound accounts for, and this function knows nothing about the claim.
    * @param chat - the group to ask.
    * @param file - the cleared file.
    * @param bytes - its contents, read before the room was asked.

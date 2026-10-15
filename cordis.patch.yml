@@ -49,7 +49,9 @@
         # senderAllowlist: []   # empty serves anyone who can DM the app
         # groupAllowlist: []    # empty serves any group
         # approvers: []         # empty lets whoever drives a chat approve;
-        #                       # settled cards best-effort name the decider, else show open_id
+        #                       # also gates the plan review (approving one
+        #                       # starts executing the plan); settled cards
+        #                       # best-effort name the decider, else show open_id
 
     # No extra row is needed for this package's browser half. The `lark-channel`
     # row above already names the package, and the client module system serves

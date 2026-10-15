@@ -100,6 +100,14 @@ export interface PresetState {
 export function loosensSandbox(preset: string, presets: HostPermissionPresets | undefined): boolean {
   if (presets === undefined) return true
   try {
+    // The deployment's own list first, then the bundle. `resolve` alone is not
+    // enough: it reads a name out of a record, so a name the table never listed
+    // can still resolve through the prototype chain — and such a spec carries no
+    // knobs, which reads as "does not loosen" and skips the approver this
+    // function exists to require. The host's own command rejects those names, so
+    // nothing is granted today; asking the list first is what keeps this gate
+    // and that command answering the same question the same way.
+    if (!presets.names.includes(preset)) return true
     const spec = presets.resolve(preset)
     return spec.sandbox === UNCONFINED_SANDBOX || spec.approval === NEVER_ASK
   } catch {

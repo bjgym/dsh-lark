@@ -1441,6 +1441,41 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('holds a group /get to the same outstanding-file bound as the model', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const command = async (): Promise<void> => {
+        await harness.fake.emitMessage(fakeMessage({
+          chatType: 'group',
+          chatId: 'oc_group_1',
+          content: `/${GET_COMMAND} report.md`,
+        }))
+      }
+
+      // The bound is the chat's, not the model's: each command reads its file
+      // before anyone is asked, so a room that never decides would otherwise
+      // pile up one held buffer per press.
+      for (let index = 0; index < 3; index += 1) await command()
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(3) })
+
+      await command()
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('先决定完再发') })
+      expect(cardsSent(harness)).toHaveLength(3)
+
+      // A room that decides frees the slot again. Retried rather than emitted
+      // once: the fake records the upload when it is called, so the slot's
+      // release can land a moment after the file is already counted.
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!)
+        .find((value) => value.decision === 'allow')!
+      await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1' }))
+      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
+      await vi.waitFor(async () => {
+        await command()
+        expect(cardsSent(harness)).toHaveLength(4)
+      })
+      await harness.dispose()
+    })
+
     it('sends a group /get nothing when the room refuses it', async () => {
       const { workspace } = await workspaceWithArtifact()
       const harness = await mountChannel({ cwd: workspace })

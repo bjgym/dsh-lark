@@ -481,6 +481,15 @@ export interface HostSettingsDescriptor {
   readonly ns: string
   /** The row's effective config, volatile fields only. */
   readonly value?: unknown
+  /**
+   * The part of that config the USER document itself supplies, when published.
+   *
+   * The difference between this and {@link HostSettingsDescriptor.value} is what
+   * tells a secret a deployment injected from one this plugin's onboarding
+   * wrote: migration must move the second and leave the first with its owner.
+   * Optional because an older seam publishes the effective value alone.
+   */
+  readonly user?: unknown
   /** Monotonic revision, for a caller that wants to fence its write. */
   readonly revision?: number
 }

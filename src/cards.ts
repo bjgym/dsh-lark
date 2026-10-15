@@ -464,6 +464,26 @@ function clip(value: string, max: number): { readonly shown: string; readonly hi
 }
 
 /**
+ * How long a decider's name may be on a card.
+ *
+ * The name comes from the platform's callback or from a chat roster this channel
+ * does not own, so its length is not this channel's to assume: an oversized
+ * value pushes the card toward the platform's own limit, and a card the platform
+ * refuses is a decision nobody can read back. Matches the bound the bridge
+ * already applies where it resolves a name, so both layers agree.
+ */
+const DECIDER_MAX_CHARS = 64
+
+/**
+ * One decider's name, as a card may print it.
+ * @param name - the name the platform or the roster gave.
+ * @returns the name, clipped to {@link DECIDER_MAX_CHARS} code points.
+ */
+function deciderName(name: string): string {
+  return clip(name, DECIDER_MAX_CHARS).shown
+}
+
+/**
  * One entry of a literal table, by its own key only.
  *
  * `table[key] ?? fallback` is not enough for a string key: `'constructor'`
@@ -658,7 +678,7 @@ export function settledApprovalCard(input: {
     ? fill(APPROVAL.decidedElsewhere, input.toolName)
     : input.decidedBy === undefined || input.decidedBy === ''
       ? input.toolName
-      : join(fill(APPROVAL.decidedBy, input.toolName), input.decidedBy)
+      : join(fill(APPROVAL.decidedBy, input.toolName), deciderName(input.decidedBy))
   return card(settled.state, join(settled.title, `：${input.toolName}`, `: ${input.toolName}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),
@@ -771,7 +791,7 @@ export function settledFileApprovalCard(input: {
   // able to tell what was allowed.
   const context = input.decidedBy === undefined || input.decidedBy === ''
     ? where
-    : join(fill(APPROVAL.decidedBy, where), input.decidedBy)
+    : join(fill(APPROVAL.decidedBy, where), deciderName(input.decidedBy))
   return card(settled.state, join(settled.title, `：${path.shown}`, `: ${path.shown}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),
@@ -1466,7 +1486,7 @@ export function settledSessionsCard(input: {
   // should see whose press moved it.
   const context = input.decidedBy === undefined || input.decidedBy === ''
     ? fill(SESSIONS.context, where)
-    : join(fill(SESSIONS.decidedBy, where), input.decidedBy)
+    : join(fill(SESSIONS.decidedBy, where), deciderName(input.decidedBy))
   const text = input.picked === undefined ? undefined : sessionRowText(input.picked, input.now ?? Date.now())
   const named = text === undefined ? { zh: '', en: '' } : bothWays(text.label)
   return card(state, { zh: `${title.zh}：${named.zh}`, en: `${title.en}: ${named.en}` }, [

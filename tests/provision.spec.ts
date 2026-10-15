@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { delimiter, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   DEFAULT_PROFILE,
@@ -26,6 +26,9 @@ import {
   readInstalledService,
   usage,
   newConsoleFilter,
+  patchPath,
+  resolveOperatorCommand,
+  windowsCommandLine,
   withInstanceRow,
   withoutInstanceRow,
 } from '../src/provision.ts'
@@ -338,6 +341,82 @@ describe('onboarding detection', () => {
     expect(isOnboarded()).toBe(false)
     writeFileSync(join(home, 'settings.yaml'), `${ROW_ID}:\n  appId: cli_x\n`)
     expect(isOnboarded()).toBe(true)
+  })
+
+  it('reads the copy a modern host leaves after importing the legacy document', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    // The host renames the document instead of deleting it, so a bot that
+    // onboarded before the profile-backed forms existed is still onboarded.
+    writeFileSync(join(home, 'settings.yaml.imported'), `${ROW_ID}:\n  appId: cli_x\n`)
+    expect(isOnboarded()).toBe(true)
+  })
+
+  it('reads the credential a scan stored behind this row\'s reference', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    expect(isOnboarded()).toBe(false)
+    // The provider's own document, and a sibling row's reference is not this
+    // row's: reporting a bot as onboarded when it is not skips its scan.
+    writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET_OTHER: s\n')
+    expect(isOnboarded()).toBe(false)
+    writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET: s\n')
+    expect(isOnboarded()).toBe(true)
+  })
+
+  it('reads a named row out of the profile patch, and only its own operation', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    const patch = patchPath(DEFAULT_PROFILE)
+    mkdirSync(dirname(patch), { recursive: true })
+    // A sibling bot's row carries a secret; this one's does not.
+    writeFileSync(patch, '- insert:\n    - id: lark-channel-other\n      name: \'dsh-lark-channel\'\n'
+      + '      config:\n        instance: other\n        appSecretRef: LARK_APP_SECRET_OTHER\n')
+    expect(isOnboarded('mine')).toBe(false)
+    expect(isOnboarded('other')).toBe(true)
+    // The row's own operation, in the shape a settings write leaves behind.
+    writeFileSync(patch, '- insert:\n    - id: lark-channel-mine\n      name: \'dsh-lark-channel\'\n'
+      + '      config:\n        instance: mine\n')
+    expect(isOnboarded('mine')).toBe(false)
+    writeFileSync(patch, '- id: lark-channel-mine\n  config:\n    appSecretRef: LARK_APP_SECRET_MINE\n')
+    expect(isOnboarded('mine')).toBe(true)
+  })
+})
+
+describe('the Windows command line', () => {
+  it('quotes only what needs it, and refuses what quoting cannot make safe', () => {
+    expect(windowsCommandLine('npm.cmd', ['install', '-g', 'pkg'])).toBe('npm.cmd install -g pkg')
+    expect(windowsCommandLine('C:\\Program Files\\nodejs\\npm.cmd', ['--version']))
+      .toBe('"C:\\Program Files\\nodejs\\npm.cmd" --version')
+    // Every one of these is cmd.exe syntax rather than text, so a command line
+    // carrying it is refused instead of being escaped into a different path.
+    for (const unsafe of ['a&b', 'a|b', 'a>b', 'a<b', 'a^b', 'a%b', 'a!b', 'a"b', 'a\nb', 'a\rb']) {
+      expect(() => windowsCommandLine('npm.cmd', [unsafe])).toThrow()
+    }
+  })
+
+  it('resolves a bare name to the file PATH holds, so a shim is recognized as one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'path-'))
+    const shim = join(dir, 'npm.cmd')
+    writeFileSync(shim, '@echo off\n')
+    // Readable on every host the suite runs on: POSIX wants the execute bit.
+    chmodSync(shim, 0o755)
+    // A bare `npm` IS that shim on Windows, which is why the name alone cannot
+    // decide how to spawn it.
+    expect(resolveOperatorCommand('npm', 'win32', dir)).toBe(shim)
+    // Spelled as a path, it is kept as typed: resolving it again would let PATH
+    // override what the caller named.
+    expect(resolveOperatorCommand('.\\npm.cmd', 'win32', dir)).toBe('.\\npm.cmd')
+    // Nowhere in PATH: the caller's own word survives, so the failure names it.
+    expect(resolveOperatorCommand('nope', 'win32', dir)).toBe('nope')
+    // POSIX executes the word itself and needs no resolution.
+    expect(resolveOperatorCommand('npm', 'linux', dir)).toBe('npm')
   })
 })
 

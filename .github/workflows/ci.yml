@@ -39,3 +39,9 @@ jobs:
 
       - run: pnpm typecheck
       - run: pnpm test
+
+      # The published artifacts are what a deployment installs, and nothing
+      # above builds them: `typecheck` emits types, `test` runs from source. A
+      # bundling or declaration regression would otherwise reach the registry
+      # through the release workflow's own `prepare` step.
+      - run: pnpm build

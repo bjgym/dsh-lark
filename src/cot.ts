@@ -123,9 +123,20 @@ function boundedFallback(content: object): string {
     : JSON.stringify({ truncated: true, dropped: encoded.length })
 }
 
-/** Bound a value a tool produced before it rides an event. */
+/**
+ * Bound a value a tool produced before it rides an event.
+ *
+ * Cut on code points, and counted the same way: slicing UTF-16 code units can
+ * end on half of a surrogate pair, which reaches the platform as an unpaired
+ * escape, and the notice beside it would then be wrong for every emoji or
+ * supplementary character in the text.
+ * @param text - the value to bound.
+ * @param limit - the longest result, in code points.
+ * @returns the value, with a notice when it was cut.
+ */
 function boundResult(text: string, limit = 1500): string {
-  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+  const points = Array.from(text)
+  return points.length <= limit ? text : `${points.slice(0, limit - 1).join('')}…`
 }
 
 /** Options for {@link createCotRenderer}. */
@@ -238,7 +249,11 @@ export function createCotRenderer(
       : cotEvent('RUN_ERROR', { message: failure, code: 'TURN_FAILED' }))
     const settled = run.draining
     closing.add(settled)
-    void settled.finally(() => closing.delete(settled))
+    // Caught like the sibling in `outbound.ts`: `finally` passes a rejection
+    // through, and this promise is awaited by nobody until disposal, so a failed
+    // drain would otherwise surface as an unhandled rejection — a process-level
+    // fault for one failed thinking-process write.
+    void settled.finally(() => closing.delete(settled)).catch(() => {})
   }
 
   return {

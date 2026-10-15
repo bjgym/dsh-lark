@@ -183,6 +183,19 @@ export interface QuestionPorts {
   update(messageId: string, card: object): Promise<void>
   /** Operator console line. */
   report(line: string): void
+  /**
+   * Whether one press may settle a question that carries approver semantics.
+   *
+   * Asked only for the questions this store was told to gate
+   * ({@link ChatQuestions.ask}'s `requiresApprover`), and answered by the same
+   * rule an approval click faces: a question that releases a plan is an
+   * escalation of sorts, and a deployment that named approvers has said who may
+   * grant it. Absent means the deployment composes no such rule, and every press
+   * the chat admits counts.
+   * @param click - who pressed, and where.
+   * @returns the refusal for the operator log, or undefined when the press counts.
+   */
+  refuseApprover?(click: QuestionClick): string | undefined
 }
 
 /** One question waiting for its human. */
@@ -190,6 +203,24 @@ interface Pending {
   readonly sessionId: string
   readonly chatId: string
   readonly question: AskedQuestion
+  /**
+   * Whether this question carries approver semantics.
+   *
+   * Read at press time, because the rule it names can only be answered by the
+   * deployment: a plan review releases a plan the model then executes, which is
+   * the one question here that grants something rather than merely informing.
+   */
+  readonly requiresApprover: boolean
+  /**
+   * The card this question is on, once a send named one.
+   *
+   * One id, because a send that rejects is the only way to get a second card —
+   * and such a send never names the card it may have rendered. The retry's own
+   * card is therefore the one this question knows, and it is repainted on every
+   * settle. A first attempt that rendered a card and still rejected leaves one
+   * card this store cannot name; the retry is still the right trade, because a
+   * rare duplicate beats a question nobody was ever asked.
+   */
   messageId?: string | undefined
   settled: boolean
   settle(answer: QuestionAnswer): void
@@ -225,6 +256,15 @@ export class ChatQuestions {
     readonly question: AskedQuestion
     readonly signal?: AbortSignal | undefined
     readonly timeoutMs?: number | undefined
+    /**
+     * Whether a press must also satisfy the deployment's approver rule.
+     *
+     * Set for the questions that grant something — the plan review releases the
+     * plan the model then executes — so a deployment that narrowed who may
+     * approve an escalation gets the same narrowing here. Ordinary questions
+     * leave it off: they inform a decision the chat is already allowed to make.
+     */
+    readonly requiresApprover?: boolean | undefined
   }): Promise<QuestionAnswer> {
     // A turn that was already cancelled must not be asked: `AbortSignal` does
     // not replay for a listener added late, so without this the card would go
@@ -239,6 +279,7 @@ export class ChatQuestions {
       sessionId: input.sessionId,
       chatId: input.chatId,
       question: input.question,
+      requiresApprover: input.requiresApprover === true,
       settled: false,
       settle,
     }
@@ -257,18 +298,30 @@ export class ChatQuestions {
     )
     timer.unref?.()
 
+    /**
+     * Send one card, remember it, and repaint it at once when the question
+     * settled while the send was in flight.
+     *
+     * Shared by the first attempt and its retry: the retry used to skip this
+     * repaint, so a question settled during a slow second send left a freshly
+     * rendered card offering a press that could no longer decide anything.
+     */
+    const post = async (): Promise<void> => {
+      const messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
+      entry.messageId = messageId
+      if (!entry.settled) return
+      // Settled while the card was in flight; paint what the platform just
+      // rendered so no live buttons are left behind. Caught like the repaint in
+      // `finish`: this runs off no caller's await, and an unhandled rejection
+      // here is a process-level fault for one failed card.
+      void this.ports.update(messageId, settledQuestionCard(input.question, { cancelled: true }))
+        .catch((error: unknown) => {
+          this.ports.report(`lark-channel: repainting a settled question failed: ${String(error)}`)
+        })
+    }
+
     try {
-      entry.messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
-      if (entry.settled) {
-        // Settled while the card was in flight; paint what the platform just
-        // rendered so no live buttons are left behind. Caught like the sibling
-        // repaint below: this runs off no caller's await, and an unhandled
-        // rejection here is a process-level fault for one failed card.
-        void this.ports.update(entry.messageId, settledQuestionCard(input.question, { cancelled: true }))
-          .catch((error: unknown) => {
-            this.ports.report(`lark-channel: repainting a settled question failed: ${String(error)}`)
-          })
-      }
+      await post()
     } catch (error) {
       // One retry, because a card send fails transiently far more often than it
       // fails permanently. A question that still cannot be delivered answers
@@ -278,7 +331,7 @@ export class ChatQuestions {
       // that can hold it.
       this.ports.report(`lark-channel: sending a question card failed, retrying once: ${String(error)}`)
       try {
-        entry.messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
+        await post()
       } catch (retry: unknown) {
         this.ports.report(`lark-channel: sending a question card failed again, so no answer was asked for: ${String(retry)}`)
         this.finish(id, { id: input.question.id, selected: [] }, false)
@@ -313,6 +366,18 @@ export class ChatQuestions {
         `lark-channel: ignored a question click from chat ${click.chatId}; the card was published to ${entry.chatId}`,
       )
       return undefined
+    }
+    // A question that grants something also faces the deployment's approver
+    // rule, which is the same narrowing an approval click meets. Asked here
+    // rather than at the dispatch site because the chat check above is the only
+    // other thing this press has to satisfy, and both belong to the store that
+    // owns the pending entry.
+    if (entry.requiresApprover) {
+      const refusal = this.ports.refuseApprover?.(click)
+      if (refusal !== undefined) {
+        this.ports.report(`lark-channel: rejected a question click: ${refusal}`)
+        return undefined
+      }
     }
     if (value.option === SUBMIT_OPTION) return this.answerBySubmission(value.id, entry, chosen ?? [])
     const option = (entry.question.options ?? [])[value.option]

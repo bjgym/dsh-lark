@@ -222,7 +222,7 @@ dsh web
 <details>
 <summary>权限与高级选项</summary>
 
-- 飞书应用的可用范围决定谁能找到机器人；`senderAllowlist`、`groupAllowlist` 和 `approvers` 可以进一步收窄权限。
+- 飞书应用的可用范围决定谁能找到机器人；`senderAllowlist`、`groupAllowlist` 和 `approvers` 可以进一步收窄权限。`approvers` 同时管审批卡和计划审批卡（批准计划会离开规划模式并开始执行，属于一次授权）；普通提问不受它限制。
 - `workspaceRoots` 可以限制聊天中允许切换到的目录。
 - `sessionScope` 支持 `chat`、`chat-thread` 和 `chat-sender` 三种会话粒度。
 - `instance` 用于命名额外的机器人实例；第一个机器人保持未命名，以兼容已有设置和会话。

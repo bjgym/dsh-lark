@@ -222,7 +222,7 @@ dsh web
 <details>
 <summary>Permissions and advanced options</summary>
 
-- The app's visibility scope decides who can reach the bot at all; `senderAllowlist`, `groupAllowlist`, and `approvers` narrow it further.
+- The app's visibility scope decides who can reach the bot at all; `senderAllowlist`, `groupAllowlist`, and `approvers` narrow it further. `approvers` covers the plan review as well as approval cards — approving a plan leaves plan mode and starts executing it, which is a grant — while ordinary questions are not restricted by it.
 - `workspaceRoots` fences the directories a chat may switch into.
 - `sessionScope` is `chat`, `chat-thread`, or `chat-sender`.
 - `instance` names an extra bot row; the first stays unnamed, which keeps its settings and sessions exactly where they are.

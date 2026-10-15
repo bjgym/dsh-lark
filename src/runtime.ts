@@ -357,19 +357,25 @@ export function apply(ctx: Context, config: Config): void {
     // inside `resolveAppSecret`, so a composition that injects the value keeps
     // owning it.
     const inlineSecret = typeof resolved.appSecret === 'string' && resolved.appSecret !== ''
+    // The reference this row's secret is actually resolved through: a deployment
+    // that named its own `appSecretRef` owns that one, and the identity's own
+    // reference is only the default. Both the resolution and the watch below
+    // name this same value, because watching the default instead reported
+    // nothing when a deployment's own reference rotated.
+    const secretRef = resolved.appSecretRef ?? identity.secretRef
     const secret = await resolveAppSecret(
       credentials,
-      { ...resolved, appSecretRef: resolved.appSecretRef ?? identity.secretRef },
+      { ...resolved, appSecretRef: secretRef },
       internals.notify,
     )
     if (secret !== undefined) resolved = { ...resolved, appSecret: secret }
-    watchAppSecret(ctx, credentials, identity.secretRef, resolved.appSecret, internals.notify)
+    watchAppSecret(ctx, credentials, secretRef, resolved.appSecret, internals.notify)
     // The two facts an operator asks for right after something was fixed, and
     // neither is visible from the chat: where the secret came from, and whether
     // managed state is durable. Filled here, reported with the connection.
     credentialOrigin = inlineSecret
       ? '内联配置'
-      : secret === undefined ? '未配置（会扫码注册）' : `凭据 ${resolved.appSecretRef ?? identity.secretRef}`
+      : secret === undefined ? '未配置（会扫码注册）' : `凭据 ${secretRef}`
     stateDurable = binding.durable
 
     if (hasCredentials(resolved)) {

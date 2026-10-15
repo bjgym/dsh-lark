@@ -267,6 +267,11 @@ export interface Config {
    * the channel may best-effort resolve it from the chat roster and safely
    * falls back to the open id. Set this when an escalation should need a named
    * human — it grants more power than the sandbox allows.
+   *
+   * The plan review counts as an escalation: approving one leaves plan mode and
+   * starts executing the plan, so a press on its card faces this same list.
+   * Ordinary questions do not — they inform a decision the chat may already
+   * make, and answering one has never granted anything.
    */
   approvers?: string[]
   /**
