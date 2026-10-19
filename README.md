@@ -52,7 +52,7 @@ pnpm install
 pnpm build
 ```
 
-`pnpm build` 产出 `lib/index.js`、`lib/cli.js`、`lib/invariant.js` 和网页半边的 `lib/client.js`。`pnpm run prepare`（Git 与 tarball 安装走的那条，`pnpm install` 也会顺带跑它）产出同一套：Host 声明、Client 面的声明与 JS，以及同一个 `lib/client.js`；区别只在它会先清空 `lib/` 再全量重建，所以日常改代码用 `pnpm build` 更省时间。
+`pnpm build` 产出 `lib/index.js`、`lib/cli.js` 和网页半边的 `lib/client.js`。`pnpm run prepare`（Git 与 tarball 安装走的那条，`pnpm install` 也会顺带跑它）产出同一套：Host 声明、Client 面的声明与 JS，以及同一个 `lib/client.js`；区别只在它会先清空 `lib/` 再全量重建，所以日常改代码用 `pnpm build` 更省时间。
 
 **3. 装进一个 profile。** `dsh plugin` 把参数转给 profile 目录里的 pnpm，相对路径按你当前所在的目录解析；profile 不存在时会以 `@deepseek-ai/dsh-base` 初始化，然后因为本包声明了 `dsh.bundle` 而把它追加进 `dsh.profile.bundles`，并以链接方式指向这份 checkout：
 
@@ -240,7 +240,7 @@ dsh web
 - 语音消息只落盘，不会被转写成文字。
 - 诊断默认只落在进程终端；指定 `diagnosticsFile` 后本渠道把它追加进文件（带扩展名的路径就是文件，否则视为目录并放入 `dsh-lark-diagnostics.log`），`diagnosticsLevel` 是保留下限，默认 `warn`（可设 `debug`/`info`/`warn`/`error`）。`diagnoseSessions` 默认关，打开后逐条报告 `/sessions` 放行或扣下了哪个候选及原因，并给出各阶段计数——行数随被扣记录数增长，是排查「列表怎么这么短」用的。
 - 配置在启动时读取，修改后需要重启服务。工作区切换、模型切换、会话指针（`/sessions` 选的或 `/new` 铸的）和扫码得到的凭据会写回宿主的 settings，下次启动仍在；承载这些字段的 schema 标了 volatile，这正是宿主允许写入的条件——没标的话宿主会拒绝写入，渠道只能在内存里记着，看起来却像是成功了。写入失败现在会同时进控制台与 `diagnosticsFile`，不再只在终端一闪而过。旧的 `chatEpochs` 字段只读保留：跑在 `--e<N>` 上的会话仍接得回来，但它不再被写入。
-- App Secret 轮换只有重启才生效：渠道能通过宿主的 credentials 事件知道引用变了并重新解析，但已经建好的连接仍然用它启动时拿到的那份 secret，所以换 secret 之后要重启服务。
+- App Secret 轮换只有重启才生效：渠道能通过宿主的 credentials 事件知道引用变了并重新解析，但已经建好的连接仍然用它启动时拿到的那份 secret，所以换 secret 之后要重启服务。另外，宿主的凭据存储**优先于环境变量**：扫码得到的 secret 存在存储里，此后即使 `LARK_APP_SECRET` 还导出着，连上去的仍是存储里那份——只改导出的值不会有任何效果，必须替换或删除存储里的同名引用；连接日志里的「密钥来自凭据存储 / 来自环境变量」就是用来分辨这件事的。
 
 </details>
 

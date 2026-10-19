@@ -53,9 +53,15 @@ export interface HostCredentials {
  * The reference this channel stores its app secret under.
  *
  * Deliberately the same name as the environment variable the provisioning CLI
- * writes: a deployment that exports `LARK_APP_SECRET` is already configured,
- * because the local provider resolves an inherited environment variable before
- * anything it stores itself.
+ * writes, because both are answers to "where is the app secret" and one name is
+ * easier to reason about than two. They do NOT rank equally, and the ranking is
+ * the harness's: a composed credentials provider resolves its own stored value
+ * BEFORE an inherited environment variable, and falls back to the environment
+ * only while the store holds nothing under that name. A deployment that both
+ * onboarded (which stores the secret here) and still exports the name is
+ * therefore connecting with the STORED secret, so rotating the exported one has
+ * no effect until the stored entry is replaced or removed — which is why the
+ * resolved source is reported with the connection.
  */
 export const APP_SECRET_REF = 'LARK_APP_SECRET'
 
@@ -81,19 +87,23 @@ export function isCredentialRef(ref: string): boolean {
  * @param credentials - the seam, when a provider is composed.
  * @param config - the app id, the inline secret, and the reference.
  * @param report - operator console line for a reference that cannot resolve.
- * @returns the secret, or undefined when neither source has one.
+ * @returns the secret and where it came from, or undefined when neither source
+ *   has one. The source is the provider's own label, and it is what tells a
+ *   stored secret apart from an exported one when both exist.
  */
 export async function resolveAppSecret(
   credentials: HostCredentials | undefined,
   config: { readonly appSecret?: string | undefined; readonly appSecretRef?: string | undefined },
   report: (line: string) => void,
-): Promise<string | undefined> {
+): Promise<ResolvedCredential | undefined> {
   // Only a non-empty string is a secret the deployment injected. A value that
   // arrived from configuration may be neither: an inline `!!js` expression whose
   // environment variable is unset resolves to a non-string, and returning that
   // would hand the transport a value that is not a secret while hiding the
   // reference that does hold one.
-  if (typeof config.appSecret === 'string' && config.appSecret !== '') return config.appSecret
+  if (typeof config.appSecret === 'string' && config.appSecret !== '') {
+    return { value: config.appSecret, source: 'config' }
+  }
   const ref = config.appSecretRef
   if (ref === undefined || ref === '') return undefined
   if (!isCredentialRef(ref)) {
@@ -112,7 +122,7 @@ export async function resolveAppSecret(
     report(`lark-channel: credential "${ref}" is not configured`)
     return undefined
   }
-  return resolved.value
+  return resolved
 }
 
 /** What became of an attempt to put a secret behind a reference. */

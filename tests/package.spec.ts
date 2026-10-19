@@ -118,9 +118,4 @@ describe('built entries', () => {
     expect(entry.Config).toBeDefined()
     expect('default' in entry).toBe(false)
   })
-
-  it('lib/invariant.js imports', async () => {
-    const invariant = (await import(join(root, 'lib', 'invariant.js'))) as Record<string, unknown>
-    expect(typeof invariant.apply).toBe('function')
-  })
 })

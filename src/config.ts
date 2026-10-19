@@ -227,6 +227,13 @@ export interface Config {
    * away), and a plan review is still answered by this channel's shadowed plan
    * tool. A deployment that names either one denies it through the guard below,
    * and the model is told to ask in prose instead.
+   *
+   * `working_directory` is the one a chat is most likely to want here. A
+   * conversation's sandbox is the directory it was bound to, and this channel
+   * resolves what the model sends against that binding, so an agent that moves
+   * its own execution directory can write where a `send_file` will then refuse
+   * to read. Denying the tool keeps the two in step; leaving it available lets
+   * a chat follow the host's own grouping instead.
    */
   denyTools?: string[]
   /**
@@ -357,11 +364,18 @@ export interface ResolvedConfig {
  *
  * The host's write path reads `schema.meta.volatile` — its `volatileForm` and
  * `isVolatilePath` are what refuse a patch to anything else — and the flag is
- * what makes this channel's managed state durable instead of memory-only.
- * schemastery exposes it through the `.volatile()` builder from 3.18.4 on, while
- * this package's declared range starts at 3.18.1, where the metadata exists and
- * the builder does not; the host reads the metadata, not the method that wrote
- * it, so it is set below.
+ * what makes this channel's managed state durable instead of memory-only. The
+ * host reads the metadata, not the method that wrote it, so it is set below
+ * rather than through schemastery's `.volatile()` builder.
+ *
+ * The flag must stay METADATA-ONLY, which is why `package.json` pins
+ * `@deepseek-ai/schemastery` to the exact 3.18.1 instead of a range. From the
+ * published 3.18.3 on, the same `meta.volatile` also makes the field PARSE into
+ * a stable reference — the `Volatile` cell DSH's own packages read through
+ * `.get()` — so `config.appId` would stop being a string and every plain read of
+ * the seven fields below would break, starting with the credential check that
+ * decides whether to connect or to onboard. Adopting the reference form is a
+ * deliberate migration across every read of these fields, not a dependency bump.
  *
  * Nothing outside this list is volatile on purpose: `cwd`, `workspaceRoots`,
  * `model` and the switches are read while the agent is being built, so editing

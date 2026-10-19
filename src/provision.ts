@@ -451,7 +451,9 @@ function rowCredentialInPatch(document: string, rowId: string, ref: string): boo
  * a scan's secret lands behind the row's own reference, and the profile's patch
  * layer where a modern host persists the row's config when no credentials
  * provider is composed. Reading only the first is what sent an
- * already-onboarded named bot back to the QR flow for the whole watch.
+ * already-onboarded named bot back to the QR flow for the whole watch — and
+ * reading the second for a profile that disables the store is the mirror
+ * mistake, answered below.
  * @param instance - the row's instance name, absent for the unnamed row.
  * @param profile - the profile whose patch layer to read.
  * @returns true when the bot already has credentials to connect with.
@@ -467,9 +469,28 @@ export function isOnboarded(instance?: string, profile: string = DEFAULT_PROFILE
     path => hasCredentialSection(readIfPresent(path) ?? '', identity.settingsNamespace),
   )) return true
   // The reference is the one identifier no sibling row shares, which is what
-  // makes this answer about THIS row rather than about the deployment.
-  if (hasCredentialSection(readIfPresent(join(home, '.credentials.yaml')) ?? '', identity.secretRef)) return true
+  // makes this answer about THIS row rather than about the deployment — and a
+  // profile that disables the store reads none of it, so a secret there says
+  // nothing about whether this profile can authenticate.
+  if (profileReadsCredentialStore(profile)
+    && hasCredentialSection(readIfPresent(join(home, '.credentials.yaml')) ?? '', identity.secretRef)) return true
   return rowCredentialInPatch(readIfPresent(patchPath(profile)) ?? '', rowIdOf(instance), identity.secretRef)
+}
+
+/**
+ * Whether one profile's composed rows read the harness credential store.
+ *
+ * The shipped `headless` profile deliberately disables the store, so a secret
+ * sitting under `refs` in `$DSH_HOME/.credentials.yaml` authenticates nothing
+ * there: answering "onboarded" from that file starts the bot against a
+ * credential its own process never reads, and the operator gets a service that
+ * comes up and never connects. Headless takes its credentials from the launch
+ * environment, which the environment pair check above already covers.
+ * @param profile - the profile the supervised process will run.
+ * @returns whether a stored reference can authenticate that profile.
+ */
+export function profileReadsCredentialStore(profile: string): boolean {
+  return profile.trim().toLowerCase() !== 'headless'
 }
 
 /**

@@ -56,6 +56,23 @@ function hasCredentials(config: ResolvedConfig): config is ChannelConfig {
 }
 
 /**
+ * Name where a resolved app secret came from, in the operator's terms.
+ *
+ * The harness resolves a reference from its own store BEFORE an inherited
+ * environment variable, so a deployment that both onboarded and still exports
+ * the name connects with the stored secret. That fact is invisible from the
+ * chat, which is why the connection line carries it.
+ * @param source - the provider's own source label.
+ * @returns the phrase to print beside the reference.
+ */
+function secretOrigin(source: string | undefined): string {
+  if (source === 'file') return '来自凭据存储'
+  if (source === 'env') return '来自环境变量'
+  if (source === 'config') return '来自内联配置'
+  return source === undefined || source === '' ? '来源未知' : `来自 ${source}`
+}
+
+/**
  * The transport options one deployment runs under.
  *
  * Separated from the client it configures so the decisions here — who the
@@ -352,10 +369,10 @@ export function apply(ctx: Context, config: Config): void {
 
     // Nothing defaults `appSecretRef` out of the Loader, so a deployment that
     // exported this row's reference is configured only because the identity's
-    // own reference is named here — which is the documented promise that
-    // exporting `LARK_APP_SECRET` is enough. An inline `appSecret` still wins
-    // inside `resolveAppSecret`, so a composition that injects the value keeps
-    // owning it.
+    // own reference is named here — exporting `LARK_APP_SECRET` is enough while
+    // the credential store holds nothing under that name, because the store
+    // outranks the environment. An inline `appSecret` still wins inside
+    // `resolveAppSecret`, so a composition that injects the value keeps owning it.
     const inlineSecret = typeof resolved.appSecret === 'string' && resolved.appSecret !== ''
     // The reference this row's secret is actually resolved through: a deployment
     // that named its own `appSecretRef` owns that one, and the identity's own
@@ -368,14 +385,14 @@ export function apply(ctx: Context, config: Config): void {
       { ...resolved, appSecretRef: secretRef },
       internals.notify,
     )
-    if (secret !== undefined) resolved = { ...resolved, appSecret: secret }
+    if (secret !== undefined) resolved = { ...resolved, appSecret: secret.value }
     watchAppSecret(ctx, credentials, secretRef, resolved.appSecret, internals.notify)
     // The two facts an operator asks for right after something was fixed, and
     // neither is visible from the chat: where the secret came from, and whether
     // managed state is durable. Filled here, reported with the connection.
     credentialOrigin = inlineSecret
       ? '内联配置'
-      : secret === undefined ? '未配置（会扫码注册）' : `凭据 ${secretRef}`
+      : secret === undefined ? '未配置（会扫码注册）' : `凭据 ${secretRef}（${secretOrigin(secret.source)}）`
     stateDurable = binding.durable
 
     if (hasCredentials(resolved)) {

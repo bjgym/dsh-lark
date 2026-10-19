@@ -9,7 +9,7 @@
  * @module dsh-lark-channel/commands
  */
 
-import type { HostAgent, HostCommands } from './host.ts'
+import type { HostAgent, HostCancelCause, HostCommands } from './host.ts'
 import { GET_COMMAND } from './outbound-file.ts'
 import { SESSIONS_COMMAND } from './sessions.ts'
 import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
@@ -24,8 +24,12 @@ export const STOP_COMMAND = 'stop'
 export const HELP_COMMAND = 'help'
 
 
-/** The cause recorded when a chat cancels its own turn. */
-const CANCEL_CAUSE = 'user'
+/**
+ * The cause recorded when a chat cancels its own turn. The host reads the
+ * `kind` off this object when it writes the turn's end reason, so a label here
+ * would abort the turn and then throw while recording why.
+ */
+const CANCEL_CAUSE: HostCancelCause = { kind: 'user' }
 
 /** Leading slash plus the command name, the only part this module parses. */
 const COMMAND_LINE = /^\/([a-zA-Z][\w-]*)/

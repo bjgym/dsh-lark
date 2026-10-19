@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — 2026-10-19
+
+适配 DSH 0.2.1-rc.2：宿主移除了运行时 invariant 注册表，凭据存储改为优先于环境变量，`working_directory` 让会话的执行目录可以中途改变。
+
+### Changed
+- **对齐 0.2.1 的依赖与兼容声明。** 11 个 `@deepseek-ai/dsh-*` 开发依赖升到 `0.2.1-rc.2`，`@deepseek-ai/cordis` 升到 `^4.0.5`，`@deepseek-ai/cordis-plugin-loader` 升到 `^1.0.6`；`package.json` 新增 `engines.dsh: ^0.2.1-rc.2`——宿主自 0.2.1 起以它作为唯一的兼容判据，而本包此前既无 `engines.dsh` 也无 DSH peer，任何版本都会被静默放行。
+- **`@deepseek-ai/schemastery` 改为精确钉 `3.18.1`。** 3.18.3 起，同一个 `meta.volatile` 元数据在**解析**时也会把字段变成引用单元（DSH 自己的包用 `.get()` 读的那种），`config.appId` 不再返回字符串，凭据检查随即失败并转入扫码流程——测试与线上都会如此。本包只借这个元数据让宿主的 settings 能写入这些字段，值必须保持原样，所以钉死版本而不是放宽范围；改用引用形态是一次涉及这七个字段每一处读取的迁移，另作安排。
+- **删除 invariant 伴随插件。** 0.2.1 移除了 `@deepseek-ai/dsh-invariants`、`ctx.invariants` 服务以及所有 `<pkg>/invariant` 子路径；`src/invariant.ts`、`./invariant` 导出、两处构建入口、`lib/invariant.js`、相关测试与 README 产物清单同步删除，`cordis.patch.yml` 里那段"诊断组合可以加一行"的注释改为说明它已不存在。
+- **`/stop` 改传结构化取消原因。** 宿主按 `kind` 读取取消原因来写 `turn/end`，此前传字符串 `'user'` 会在记录原因时抛 `unreachable variant`；现在传 `{ kind: 'user' }`。
+- **计划评审的"仅计划模式"守卫改读服务自身状态。** 此前从会话日志折叠 `plan/mode`，而 `Session` 从来没有 `events` 成员，守卫从未生效；现在读 `planMode.get(agent)`（宿主 0.2.1 公开的读法），服务只发布 `set` 时仍然放行而不是拒绝。
+- **连接日志写明密钥来源。** 宿主的凭据存储优先于环境变量，所以"扫码存过、环境变量还导出着"的部署连的是存储里那份；日志现在显示「来自凭据存储」或「来自环境变量」，不再只报引用名。
+- **`headless` profile 不再被当成已引导。** 0.2.1 的 headless 不读凭据存储，`isOnboarded` 却无条件读 `.credentials.yaml`，于是报告"已引导"并启动一个认证不上的服务；现在按 profile 判断，headless 只认环境变量对。
+- **文档**：`denyTools` 的说明补上 `working_directory`——会话沙箱是本会话被绑定的目录，该工具移动的是执行目录，而 `/cd`、会话选择器和 `send_file` 仍按绑定的目录解析；想保持两者一致就把它列进 `denyTools`（默认不变）。
+
+### Known limitations
+- 计划评审的守卫对只发布 `set` 的旧宿主仍然放行：服务答不出状态时不拒绝，是刻意保留的宽容。
+- `working_directory` 默认不拦：跟随宿主自己的 workspace 分组，还是钉住绑定的目录，留给部署决定。
+
 ## Unreleased — 2026-10-11
 
 第三轮复检后逐条收口的修复：一条 Windows 回归、一条资源边界、一条授权口径，以及若干低危尾巴。

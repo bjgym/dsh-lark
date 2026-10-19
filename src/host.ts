@@ -10,17 +10,30 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 
-/** The live session a host agent drives; only the identity is read here. */
+/**
+ * The live session a host agent drives; only the identity is read here.
+ *
+ * The log is deliberately absent: a plugin that folds state out of raw events
+ * duplicates a rule the owning service already publishes, and DSH deprecates
+ * the synchronous event reads that made it possible.
+ */
 export interface HostSession {
   /** The session id shared by the agent registry and session log. */
   readonly id: string
-  /**
-   * The session log, which several host services fold their own state out of
-   * rather than mirroring it. Read-only here: this plugin folds plan mode from
-   * it to know whether a plan review is even meaningful.
-   */
-  readonly events?: readonly HostSessionEvent[]
 }
+
+/**
+ * Why an active agent driver was cancelled, as the host records it.
+ *
+ * A structured cause, not a label: the host switches on `kind` when it writes
+ * the turn's end reason and refuses an unrecognized value there, so a bare
+ * string aborts the turn and then throws while the reason is being recorded.
+ */
+export type HostCancelCause =
+  | { readonly kind: 'user' }
+  | { readonly kind: 'parent' }
+  | { readonly kind: 'hook'; readonly reason: string }
+  | { readonly kind: 'disposed' }
 
 /** Durable metadata for one stored image, from {@link HostAttachments.saveImage}. */
 export interface HostImageRef {
@@ -194,8 +207,9 @@ export interface HostAgent {
   /**
    * Clear queued work and abort the active turn. A no-op when nothing is
    * active, so a chat may offer it unconditionally.
+   * @param cause - the structured reason the host records on the turn's end.
    */
-  cancel(cause: string): void
+  cancel(cause: HostCancelCause): void
   /**
    * Resolve once the agent has no driver or maintenance task running.
    * Optional here because the contract reaches this plugin as an object rather

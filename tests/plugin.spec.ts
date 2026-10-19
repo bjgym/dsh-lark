@@ -4,14 +4,12 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import { Context } from '@deepseek-ai/cordis'
 import type { CardActionEvent, NormalizedMessage, SendOptions } from '@larksuite/channel'
 import * as plugin from '../src/index.ts'
 import { GET_COMMAND, SEND_FILE_TOOL } from '../src/outbound-file.ts'
 import { QUESTION_TIMEOUT_MS, questionActionValue } from '../src/questions.ts'
 import { configuredAppId } from '../src/onboarding.ts'
 import { parseRoute } from '../src/model.ts'
-import * as invariant from '../src/invariant.ts'
 import type { HostApprovalOutcome, HostApprovalRequest, HostUserQuestionAnswer, HostUserQuestionRequest } from '../src/host.ts'
 import type { RegisterAppPort, RegisterAppRequest } from '../src/onboarding.ts'
 import { stripToolCallMarkup } from '../src/outbound.ts'
@@ -447,7 +445,7 @@ describe('dsh-lark-channel', () => {
     await vi.waitFor(() => { expect(reference.fake.state.connects).toBe(1) })
     const fromReference = reference.notices.find(line => line.includes('已连接')) ?? ''
     expect(fromReference).toContain('cli_ref')
-    expect(fromReference).toContain('密钥来自凭据 LARK_APP_SECRET')
+    expect(fromReference).toContain('密钥来自凭据 LARK_APP_SECRET（来自凭据存储）')
     // No settings service was composed for this mount, so nothing is durable.
     expect(fromReference).toContain('仅本次进程')
     await reference.dispose()
@@ -1563,6 +1561,9 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: '/stop' }))
       // Cancellation is an agent method, not a registered command.
       await vi.waitFor(() => { expect(created.agent.cancel).toHaveBeenCalledTimes(1) })
+      // The host reads `kind` off the cause when it writes the turn's end
+      // reason, so a bare label here aborts the turn and then throws.
+      expect(created.agent.cancel).toHaveBeenCalledWith({ kind: 'user' })
       expect(created.agent.followup).toHaveBeenCalledTimes(1)
       await vi.waitFor(() => {
         expect(harness.fake.sent.some((m) => 'markdown' in m.input && m.input.markdown.includes('已停止'))).toBe(true)
@@ -4621,7 +4622,10 @@ describe('dsh-lark-channel', () => {
   it('reviews a plan in the chat: the plan as a message, the decision as a card', async () => {
     const switched: { active: boolean }[] = []
     const harness = await mountChannel({}, {
-      planMode: { set: (_agent: unknown, active: boolean) => { switched.push({ active }); return 'queued' } },
+      planMode: {
+        set: (_agent: unknown, active: boolean) => { switched.push({ active }); return 'queued' },
+        get: () => ({ active: true }),
+      },
     })
     await harness.fake.emitMessage(fakeMessage({ content: 'plan the migration' }))
     await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
@@ -4629,8 +4633,8 @@ describe('dsh-lark-channel', () => {
     const shadow = created.registeredTools.find((tool) => tool.name === 'exit_plan_mode') as unknown as {
       execute(args: unknown, exec: unknown): Promise<{ approved: true }>
     }
-    // The tool refuses outside plan mode, which the session log is the record of.
-    created.agent.session.events.push({ type: 'plan/mode', data: { active: true } })
+    // The tool refuses outside plan mode, and the plan service is the owner of
+    // that state; this host reports it on, so the review is the one that runs.
     const plan = '# 迁移计划\n\n1. 先跑测试\n2. 再发预发'
 
     const approved = shadow.execute({ plan }, { agent: created.agent })
@@ -4652,15 +4656,13 @@ describe('dsh-lark-channel', () => {
   })
 
   it('keeps planning when the review is answered with words instead', async () => {
-    const harness = await mountChannel({}, { planMode: { set: () => 'queued' } })
+    const harness = await mountChannel({}, { planMode: { set: () => 'queued', get: () => ({ active: true }) } })
     await harness.fake.emitMessage(fakeMessage({ content: 'plan it' }))
     await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
     const created = harness.agents.created[0]!
     const shadow = created.registeredTools.find((tool) => tool.name === 'exit_plan_mode') as unknown as {
       execute(args: unknown, exec: unknown): Promise<{ approved: true }>
     }
-    created.agent.session.events.push({ type: 'plan/mode', data: { active: true } })
-
     const settled = shadow.execute({ plan: '# 计划\n步骤' }, { agent: created.agent }).catch((e: Error) => e)
     await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
     await harness.fake.emitMessage(fakeMessage({ content: '再考虑一下回滚' }))
@@ -4690,21 +4692,5 @@ describe('dsh-lark-channel', () => {
     } finally {
       delete internals.reconnectDeadlineMs
     }
-  })
-
-  it('registers the invariant companion through its local host contract', async () => {
-    const ctx = new Context()
-    const unregister = vi.fn()
-    const register = vi.fn<(packageName: string, installer: unknown) => () => void>(() => unregister)
-    const removeService = ctx.provide('invariants', { register })
-
-    const fiber = await ctx.plugin(invariant)
-    expect(register).toHaveBeenCalledTimes(1)
-    expect(register.mock.calls[0]?.[0]).toBe('dsh-lark-channel')
-    expect(typeof register.mock.calls[0]?.[1]).toBe('function')
-
-    await fiber.dispose()
-    expect(unregister).toHaveBeenCalledTimes(1)
-    await removeService()
   })
 })

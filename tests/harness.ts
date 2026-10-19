@@ -24,6 +24,7 @@ import type {
   HostCommands,
   HostAgentPresets,
   HostApprovalOutcome,
+  HostCancelCause,
   HostDefaultModel,
   HostSettings,
   HostUserMessage,
@@ -405,7 +406,7 @@ export interface CreatedAgent {
     id: string
     session: { id: string; events: { type: string; data: unknown }[] }
     followup: ReturnType<typeof vi.fn<(m: HostUserMessage) => void>>
-    cancel: ReturnType<typeof vi.fn<(cause: string) => void>>
+    cancel: ReturnType<typeof vi.fn<(cause: HostCancelCause) => void>>
     whenIdle: () => Promise<void>
     runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>) => Promise<T>
     /** Test hook: hold the agent as if a turn were driving it. */
@@ -562,7 +563,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       // out of it rather than mirroring it, and this channel reads two that way.
       session: { id: sessionId, events: [] },
       followup: vi.fn<(m: HostUserMessage) => void>(),
-      cancel: vi.fn<(cause: string) => void>(),
+      cancel: vi.fn<(cause: HostCancelCause) => void>(),
       whenIdle: async () => {
         while (driving || owner !== undefined) {
           if (owner !== undefined) await owner.catch(() => undefined)

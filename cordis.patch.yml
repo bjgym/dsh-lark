@@ -34,7 +34,11 @@
         # maxSendFileBytes: 20971520
         # hideProcessWhenDone: false # let the platform drop a finished process
         # denyTools: []              # tools denied per agent; empty by default — questions and
-        #                            # plan reviews are answered here; send_file can be listed too
+        #                            # plan reviews are answered here; send_file can be listed too.
+        #                            # Add 'working_directory' to pin a chat's sandbox to the
+        #                            # directory it was bound to: the tool moves the session's
+        #                            # execution directory, while /cd, the session picker and
+        #                            # send_file all keep reading the bound one.
         # syncSlashCommands: true    # publish commands to the bot's `/` panel
         # diagnoseSessions: false    # report why /sessions admitted or withheld each candidate
         # diagnosticsFile: ./logs    # file, or a directory holding dsh-lark-diagnostics.log;
@@ -62,9 +66,6 @@
     # browser bundle that calls `window.__ModuleLoader__.load` in Node and
     # failing the tree.
 
-    # The invariant companion stays out of the default patch: the shipped
-    # dsh-base/web profiles compose no `invariants` service (it comes from the
-    # host's runtime-diagnostics composition), and a row waiting on the absent
-    # service fails the whole tree at boot. Diagnostic compositions add:
-    #   - id: lark-channel-invariant
-    #     name: 'dsh-lark-channel/invariant'
+    # No invariant row exists any more. DSH removed the `invariants` service and
+    # every `<package>/invariant` subpath, so this package ships no companion and
+    # a diagnostic composition has nothing to add here.

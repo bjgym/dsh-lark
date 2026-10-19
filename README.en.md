@@ -52,7 +52,7 @@ pnpm install
 pnpm build
 ```
 
-`pnpm build` emits `lib/index.js`, `lib/cli.js`, `lib/invariant.js`, and the browser half's `lib/client.js`. `pnpm run prepare` — the path a Git or tarball install takes, which `pnpm install` also runs — emits the same set: the Host declarations, the Client face's declarations and JavaScript, and the same `lib/client.js`. The only difference is that it clears `lib/` and rebuilds everything, so day-to-day edits are faster with `pnpm build`.
+`pnpm build` emits `lib/index.js`, `lib/cli.js`, and the browser half's `lib/client.js`. `pnpm run prepare` — the path a Git or tarball install takes, which `pnpm install` also runs — emits the same set: the Host declarations, the Client face's declarations and JavaScript, and the same `lib/client.js`. The only difference is that it clears `lib/` and rebuilds everything, so day-to-day edits are faster with `pnpm build`.
 
 **3. Install into a profile.** `dsh plugin` forwards its arguments to pnpm inside the profile directory, and a relative path is resolved against the directory you run it from; a profile that does not exist yet is initialized with `@deepseek-ai/dsh-base`, and because this package declares `dsh.bundle` it is appended to `dsh.profile.bundles` as a link to this checkout:
 
@@ -240,7 +240,7 @@ dsh web
 - Voice messages land on disk like any other file; nothing transcribes them.
 - Diagnostics reach the process terminal by default; name `diagnosticsFile` and this channel appends them to that file instead (a path with an extension is the file, anything else is a directory that holds `dsh-lark-diagnostics.log`), with `diagnosticsLevel` as the floor (default `warn`; `debug`/`info`/`warn`/`error`). `diagnoseSessions` is off by default and, when on, reports which candidate `/sessions` admitted or withheld, under which rule, plus the counts at each stage — the line count scales with the withheld records, which is what makes a short list attributable.
 - Configuration is read at startup; changing it needs a restart. A workspace switch, a model switch, the session pointer (`/sessions` or `/new` wrote it) and a scanned credential are written back through the host's settings service and survive the restart; the schema fields carrying them are marked volatile, which is the condition the host requires before it will write at all — without the marking it refuses, and the channel would only remember them in memory while looking as if it had persisted them. A failed write now reaches both the console and `diagnosticsFile` instead of flashing past in a terminal. The older `chatEpochs` field is kept read-only: a conversation running on `--e<N>` still resumes, but nothing writes it any more.
-- A rotated App Secret takes effect on restart: the channel hears the host's credentials event and re-resolves the reference, but the connection already built keeps the secret it was constructed with, so restart the service after changing one.
+- A rotated App Secret takes effect on restart: the channel hears the host's credentials event and re-resolves the reference, but the connection already built keeps the secret it was constructed with, so restart the service after changing one. The host's credential store also OUTRANKS the environment: a scanned secret lives there, so while that entry exists an exported `LARK_APP_SECRET` is ignored — changing the exported value alone does nothing until the stored reference is replaced or removed. The connection line names which source is live.
 
 </details>
 

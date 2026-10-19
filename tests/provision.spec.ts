@@ -11,6 +11,7 @@ import {
   ensureProfileBuildPolicy,
   hasCredentialSection,
   isOnboarded,
+  profileReadsCredentialStore,
   launchdPlist,
   ownVersion,
   parseArguments,
@@ -366,6 +367,23 @@ describe('onboarding detection', () => {
     expect(isOnboarded()).toBe(false)
     writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET: s\n')
     expect(isOnboarded()).toBe(true)
+  })
+
+  it('ignores a stored credential for a profile that disables the store', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET: s\n')
+    // The shipped headless profile composes no credential store, so a secret
+    // sitting there authenticates nothing: reporting it onboarded starts a
+    // service that comes up and never connects.
+    expect(isOnboarded(undefined, 'web')).toBe(true)
+    expect(isOnboarded(undefined, 'headless')).toBe(false)
+    // Only the shipped name is special, and only in its own spelling.
+    expect(profileReadsCredentialStore('headless')).toBe(false)
+    expect(profileReadsCredentialStore('HEADLESS')).toBe(false)
+    expect(profileReadsCredentialStore('headless-2')).toBe(true)
   })
 
   it('reads a named row out of the profile patch, and only its own operation', () => {
